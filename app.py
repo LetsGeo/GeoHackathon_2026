@@ -11,7 +11,14 @@ when starting it, e.g.:
 Optional: --inline 1840 (starting inline)   --credit "Data: ..."   (paths can be absolute, or
 relative to this file's folder)
 
-Needs:  pip install segyio numpy matplotlib   (matplotlib is only used for the PDF export)
+Needs:  pip install -r requirements.txt   (panel, segyio, numpy, matplotlib, openai)
+
+Analysis summary by Gemma: "Run analysis" sends the measurements to a Gemma model
+behind an OpenAI-compatible server (default http://172.28.34.1:8000/v1, model
+google/gemma-4-26B-A4B-it) and shows its English + Malay summary. Change the server
+with --gemma-url / --gemma-model (or GEMMA_BASE_URL / GEMMA_MODEL), turn it off with
+--no-gemma. If the server can't be reached the rule-based summary is shown instead.
+Check the connection with:  python gemma_client.py
 The first load of a file reads the whole SEG-Y once and saves it in "cache/"
 (about the same size as the file), so inline, crossline and time slices are
 instant afterwards. Delete the cache folder any time to free the space.
@@ -35,6 +42,8 @@ from pathlib import Path
 
 import numpy as np
 import panel as pn
+
+import gemma_client
 import param
 from bokeh.models import Button as BkButton
 from bokeh.models import (
@@ -396,6 +405,9 @@ def parse_args():
     parser.add_argument("--monitor-label", default="2010 survey")
     parser.add_argument("--inline", type=int, default=None)
     parser.add_argument("--credit", default=SLEIPNER_CREDIT)
+    parser.add_argument("--gemma-url", default=None)    # e.g. http://172.28.34.1:8000/v1
+    parser.add_argument("--gemma-model", default=None)  # e.g. google/gemma-4-26B-A4B-it
+    parser.add_argument("--no-gemma", action="store_true")  # rule-based summary only
     args, _ = parser.parse_known_args(sys.argv[1:])
     return args
 
@@ -407,6 +419,12 @@ ARGS = parse_args()
 # optional time window in ms, e.g. (700, 1200) to zoom in on the reservoir.
 INLINE = ARGS.inline
 TIME_WINDOW_MS = None
+
+# Gemma writes the analysis summary (see gemma_client.py). The server address and
+# model can also be set with the GEMMA_BASE_URL / GEMMA_MODEL environment variables.
+USE_GEMMA = not ARGS.no_gemma and os.environ.get("GEMMA_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+GEMMA_URL = ARGS.gemma_url
+GEMMA_MODEL = ARGS.gemma_model
 
 
 def resolve_path(text):
@@ -1323,11 +1341,11 @@ def rebuild(event=None):
 # ---------------------------------------------------------------------------
 # Analysis: measure the baseline-vs-monitor differences and write a summary
 # ---------------------------------------------------------------------------
-# Everything here is rule-based. The measurements (analyse_volume /
-# analyse_slice) are plain numbers; write_summary() turns them into English and
-# Malay text. To use an AI model later, replace write_summary() with a call
-# that sends the metrics dict to the model and returns the same {"en": [...],
-# "ms": [...]} structure. Nothing else needs to change.
+# The measurements (analyse_volume / analyse_slice) are plain numbers.
+# write_summary() turns them into rule-based English and Malay text straight away;
+# when Gemma is enabled, "Run analysis" then sends the measurements, that draft and
+# two small pictures to Gemma (gemma_client.summarise) and shows its text instead.
+# If Gemma can't be reached, the rule-based text stays.
 
 ANALYSIS_TRACES = 15_000  # traces sampled across the shared area for the whole-volume analysis
 DIFF_STOPS = [(0.0, SOFTEN), (0.5, "#ffffff"), (1.0, HARDEN)]  # amplitude decrease -> increase
@@ -1824,16 +1842,35 @@ def summary_html(summary):
                 + "</div>", sizing_mode="stretch_width")
 
 
+def slice_key(sl):
+    """Which slice a summary was written for."""
+    return None if sl is None else (sl["view"], round(sl["pos"], 3))
+
+
 def render_analysis():
     """(Re)draw the analysis card. The whole-volume part is kept from the last
-    run; the slice part is recomputed for whatever slice is on screen now."""
+    run; the slice part is recomputed for whatever slice is on screen now.
+    Gemma's summary is shown while the slice is the one it was written for;
+    after the slice changes, the rule-based text is shown until the next run."""
     an = ws["analysis"]
     if not an:
         return
     sl = current_slice_analysis()
     an["slice"] = sl
     base_label, mon_label = an["labels"]
-    an["summary"] = write_summary(an["volume"], sl, base_label, mon_label)
+    rule_based = write_summary(an["volume"], sl, base_label, mon_label)
+    an["rule_summary"] = rule_based
+    gem = an.get("gemma")
+    if gem and gem["key"] == slice_key(sl):
+        an["summary"] = gem["summary"]
+    else:
+        an["summary"] = rule_based
+        if gem:
+            for lang, extra in (("en", " The slice changed since Gemma wrote its summary; "
+                                       "press Run analysis to ask Gemma again."),
+                                ("ms", " Keratan telah berubah sejak Gemma menulis ringkasannya; "
+                                       "tekan Run analysis untuk bertanya kepada Gemma semula.")):
+                rule_based[lang]["note"] += extra
     ws["afigs"] = []
     plots = [change_map_plot(an["volume"], sl)]
     if sl is not None:
@@ -1854,7 +1891,7 @@ def reset_analysis(message=None):
                                          'screen. Takes a few seconds on large files.</span>')
 
 
-def on_run(event=None):
+async def on_run(event=None):
     base, mon = ws["surveys"]
     if base["vol"] is None or mon["vol"] is None:
         reset_analysis('<span class="status err">Load both surveys first.</span>')
@@ -1863,15 +1900,42 @@ def on_run(event=None):
     run_btn.disabled = True
     try:
         vol = analyse_volume(base["vol"], mon["vol"])
-        ws["analysis"] = {"volume": vol, "labels": (base["title"], mon["title"]),
-                          "files": (base["name"], mon["name"]), "credit": ws["credit"]}
-        render_analysis()
+        an = {"volume": vol, "labels": (base["title"], mon["title"]),
+              "files": (base["name"], mon["name"]), "credit": ws["credit"]}
+        ws["analysis"] = an
+        render_analysis()  # rule-based summary straight away
         pdf_btn.filename = pdf_filename()
         pdf_btn.disabled = False
         step = vol["sample_step"]
-        analysis_status.object = ('<span class="status ok">Done</span><span class="status"> · whole volume sampled '
-                                  + ("on every line" if step == 1 else f"every {step} lines")
-                                  + ' · the slice part follows the slice you choose above</span>')
+        sampled = ('<span class="status"> · whole volume sampled '
+                   + ("on every line" if step == 1 else f"every {step} lines")
+                   + ' · the slice part follows the slice you choose above</span>')
+        if not USE_GEMMA:
+            analysis_status.object = '<span class="status ok">Done</span>' + sampled
+            return
+
+        set_label(run_btn, "Asking Gemma…")
+        pdf_btn.disabled = True  # until the final text is in
+        analysis_status.object = ('<span class="status">Measurements done · Gemma is writing the summary '
+                                  '(rule-based text shown meanwhile)…</span>')
+        sl = an["slice"]
+        args = (vol, sl, *an["labels"])
+        kwargs = {"draft": an["rule_summary"], "slice_axes": VIEW_AXES[sl["view"]] if sl else None,
+                  "base_url": GEMMA_URL, "model": GEMMA_MODEL}
+        try:
+            summary = await asyncio.to_thread(gemma_client.summarise, *args, **kwargs)
+        except Exception as exc:
+            if ws["analysis"] is an:
+                pdf_btn.disabled = False
+                analysis_status.object = (f'<span class="status err">Gemma unavailable ({escape(str(exc)[:160])})'
+                                          ' · showing the rule-based summary</span>')
+            return
+        if ws["analysis"] is not an:  # new data was loaded while Gemma was writing
+            return
+        an["gemma"] = {"key": slice_key(sl), "summary": summary}
+        render_analysis()
+        pdf_btn.disabled = False
+        analysis_status.object = '<span class="status ok">Done · summary by Gemma</span>' + sampled
     except Exception as exc:
         reset_analysis(f'<span class="status err">Analysis failed: {escape(str(exc))}</span>')
     finally:

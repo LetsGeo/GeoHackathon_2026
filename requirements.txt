@@ -1,0 +1,6 @@
+panel>=1.4
+bokeh>=3.4
+segyio
+numpy
+matplotlib
+openai>=1.0
