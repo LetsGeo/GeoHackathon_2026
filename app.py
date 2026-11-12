@@ -685,13 +685,54 @@ title_block = html(
 """
 )
 
-# Light / dark mode: the browser swaps the CSS variables instantly (jscallback),
-# and Python restyles the plots (on_theme_change, further down).
-theme_toggle = pn.widgets.Toggle(name="☀  Light mode", value=DEFAULT_THEME == "light",
-                                 stylesheets=[BTN_BASE_CSS, ".bk-btn.bk-active { background: transparent !important; }"],
-                                 margin=(5, 10))
+# Light / dark mode switch (on = light): the browser swaps the CSS variables
+# instantly (jscallback), and Python restyles the plots (on_theme_change, further down).
+# The knob shows a moon in dark mode and a sun in light mode.
+_MOON_SVG = ("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'>"
+             "<path d='M20.5 14.2A8.6 8.6 0 1 1 9.8 3.5a6.8 6.8 0 0 0 10.7 10.7z'/></svg>")
+_SUN_SVG = ("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' "
+            "stroke='black' stroke-width='2.2' stroke-linecap='round'><circle cx='12' cy='12' r='4.2' fill='black'/>"
+            "<path d='M12 2v2.4M12 19.6V22M4.9 4.9l1.7 1.7M17.4 17.4l1.7 1.7M2 12h2.4M19.6 12H22M4.9 19.1l1.7-1.7"
+            "M17.4 6.6l1.7-1.7'/></svg>")
+THEME_SWITCH_CSS = """
+:host { gap: 0 !important; }
+.bk-label, .bk-icon { display: none !important; }
+.bk-body { width: 58px !important; height: 30px !important; }
+.bk-bar {
+  position: absolute !important; inset: 0 !important; top: 0 !important; height: 100% !important;
+  box-sizing: border-box; border-radius: 15px !important;
+  background: var(--card2) !important; border: 1px solid var(--border-strong);
+  transition: background-color .25s ease, border-color .25s ease;
+}
+/* faint sun (right) and moon (left) in the track; the knob covers the current one */
+.bk-bar::before, .bk-bar::after {
+  content: ""; position: absolute; top: 50%; width: 14px; height: 14px; margin-top: -7px;
+  background: var(--muted); opacity: .8;
+  -webkit-mask: var(--icon) center / contain no-repeat; mask: var(--icon) center / contain no-repeat;
+}
+.bk-bar::before { right: 8px; --icon: url("SUN"); }
+.bk-bar::after { left: 8px; --icon: url("MOON"); }
+.bk-knob {
+  top: 3px !important; left: 3px !important; width: 24px !important; height: 24px !important;
+  border-radius: 50% !important; background: var(--accent) !important; z-index: 1;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .35);
+  transition: left .25s cubic-bezier(.3, .7, .4, 1), background-color .25s ease !important;
+}
+.bk-knob::after {
+  content: ""; position: absolute; inset: 5px; background: var(--accent-ink);
+  -webkit-mask: url("MOON") center / contain no-repeat; mask: url("MOON") center / contain no-repeat;
+}
+:host(.bk-active) .bk-bar { background: var(--accent-soft) !important; border-color: var(--accent); }
+:host(.bk-active) .bk-knob { left: 31px !important; }
+:host(.bk-active) .bk-knob::after { -webkit-mask-image: url("SUN"); mask-image: url("SUN"); }
+.bk-body:hover .bk-bar { border-color: var(--accent); }
+.bk-knob:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+""".replace("SUN", _SUN_SVG).replace("MOON", _MOON_SVG)
 
-# Easter egg: clicking the theme button 10 times within 3 seconds splatters oil
+theme_toggle = pn.widgets.Switch(name="", value=DEFAULT_THEME == "light",
+                                 stylesheets=[THEME_SWITCH_CSS], margin=(5, 10), align="center")
+
+# Easter egg: flipping the theme switch 10 times within 3 seconds splatters oil
 # over the screen for 5 seconds. Runs entirely in the browser; the overlay
 # ignores the mouse, so the app stays usable underneath.
 OIL_SPLATTER_JS = r"""
@@ -2156,7 +2197,6 @@ load_btn.on_click(rebuild)
 
 def on_theme_change(event):
     ws["theme"] = "light" if event.new else "dark"
-    set_label(theme_toggle, "☾  Dark mode" if event.new else "☀  Light mode")
     for p in ws["figs"] + ws["afigs"]:
         style_figure(p)
 
