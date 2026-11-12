@@ -501,14 +501,12 @@ nav_menu = NavMenu(
     stylesheets=[BASE_CSS, NAV_CSS], sizing_mode="stretch_width", margin=(0, 16),
 )
 
-# Light / dark mode: the browser swaps the CSS variables instantly (jscallback),
-# and Python restyles the plots (on_theme_change, further down). It sits at the
-# bottom of the sidebar.
-theme_toggle = pn.widgets.Toggle(name="☀  Light mode", value=DEFAULT_THEME == "light",
-                                 stylesheets=[BTN_BASE_CSS, ".bk-btn.bk-active { background: transparent !important; }"
-                                              " .bk-btn { width: 100%; }"],
-                                 sizing_mode="stretch_width", margin=(8, 16, 18, 16))
-# (also the oil-splatter easter egg: 10 clicks within 3 s, see OIL_SPLATTER_JS in styles.py)
+# Light / dark mode switch (on = light), at the bottom of the sidebar: the browser
+# swaps the CSS variables instantly (jscallback), and Python restyles the plots
+# (on_theme_change, further down). The knob shows a moon in dark mode, a sun in light.
+theme_toggle = pn.widgets.Switch(name="", value=DEFAULT_THEME == "light",
+                                 stylesheets=[THEME_SWITCH_CSS], width=58, height=30, margin=0, align="center")
+# (also the oil-splatter easter egg: 10 flips within 3 s, see OIL_SPLATTER_JS in styles.py)
 theme_toggle.jscallback(value="document.documentElement.classList.toggle('light', cb_obj.active);\n"
                               + OIL_SPLATTER_JS)
 
@@ -528,8 +526,9 @@ sidebar = pn.Column(
 """, sizing_mode="stretch_width"),
     nav_menu,
     pn.layout.VSpacer(),
-    html('<div class="eyebrow" style="padding: 0 26px">Appearance</div>', sizing_mode="stretch_width"),
-    theme_toggle,
+    # "Appearance" on the left, the switch on the right
+    pn.Row(html('<div class="eyebrow">Appearance</div>', align="center"), pn.layout.HSpacer(), theme_toggle,
+           sizing_mode="stretch_width", margin=(8, 30, 22, 26)),
     width=SIDEBAR_WIDTH,
     margin=0,
     # pinned to the left of the window as a rounded card, so it stays put while
@@ -2698,7 +2697,6 @@ load_btn.on_click(on_run_click)
 
 def on_theme_change(event):
     ws["theme"] = "light" if event.new else "dark"
-    set_label(theme_toggle, "☾  Dark mode" if event.new else "☀  Light mode")
     for p in ws["figs"] + ws["afigs"] + ws["wfigs"]:
         style_figure(p)
 

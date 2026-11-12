@@ -368,6 +368,66 @@ GHOST_BTN_CSS = f"""
 """
 
 
+# Light / dark mode switch (on = light). The knob shows a moon in dark mode and
+# slides right to show a sun in light mode, with faint icons in the track.
+_MOON_SVG = ("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'>"
+             "<path d='M20.5 14.2A8.6 8.6 0 1 1 9.8 3.5a6.8 6.8 0 0 0 10.7 10.7z'/></svg>")
+_SUN_SVG = ("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' "
+            "stroke='black' stroke-width='2.2' stroke-linecap='round'><circle cx='12' cy='12' r='4.2' fill='black'/>"
+            "<path d='M12 2v2.4M12 19.6V22M4.9 4.9l1.7 1.7M17.4 17.4l1.7 1.7M2 12h2.4M19.6 12H22M4.9 19.1l1.7-1.7"
+            "M17.4 6.6l1.7-1.7'/></svg>")
+# The switch's parts are .body / .bar / .knob (on = :host(.active)) in Bokeh 3.4, and
+# .bk-body / .bk-bar / .bk-knob (on = :host(.bk-active)) in newer versions; the CSS
+# is written for the newer names and _both_names() adds the 3.4 ones.
+THEME_SWITCH_CSS = """
+:host { gap: 0 !important; }
+.bk-label, .bk-icon { display: none !important; }
+.bk-body { position: relative; width: 58px !important; height: 30px !important; cursor: pointer; }
+.bk-bar {
+  position: absolute !important; inset: 0 !important; top: 0 !important; height: 100% !important;
+  box-sizing: border-box; border-radius: 15px !important;
+  background: var(--card2) !important; border: 1px solid var(--border-strong);
+  transition: background-color .25s ease, border-color .25s ease;
+}
+/* faint sun (right) and moon (left) in the track; the knob covers the current one */
+.bk-bar::before, .bk-bar::after {
+  content: ""; position: absolute; top: 50%; width: 14px; height: 14px; margin-top: -7px;
+  background: var(--muted); opacity: .8;
+  -webkit-mask: var(--icon) center / contain no-repeat; mask: var(--icon) center / contain no-repeat;
+}
+.bk-bar::before { right: 8px; --icon: url("SUN"); }
+.bk-bar::after { left: 8px; --icon: url("MOON"); }
+.bk-knob {
+  position: absolute !important; margin: 0 !important; cursor: pointer;
+  top: 3px !important; left: 3px !important; width: 24px !important; height: 24px !important;
+  border-radius: 50% !important; background: var(--accent) !important; z-index: 1;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .35);
+  /* it slides with transform (a 'left' set here would beat the :host(...) rule below) */
+  transition: transform .25s cubic-bezier(.3, .7, .4, 1), background-color .25s ease !important;
+}
+.bk-knob::after {
+  content: ""; position: absolute; inset: 5px; background: var(--accent-ink);
+  -webkit-mask: url("MOON") center / contain no-repeat; mask: url("MOON") center / contain no-repeat;
+}
+:host(.bk-active) .bk-bar { background: var(--accent-soft) !important; border-color: var(--accent); }
+:host(.bk-active) .bk-knob { transform: translateX(28px); }
+:host(.bk-active) .bk-knob::after { -webkit-mask-image: url("SUN"); mask-image: url("SUN"); }
+.bk-body:hover .bk-bar { border-color: var(--accent); }
+.bk-knob:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.bk-knob:focus { outline: none; }
+"""
+
+
+def _both_names(css):
+    """Write each switch rule for both Bokeh naming schemes (see THEME_SWITCH_CSS)."""
+    old = (css.replace(":host(.bk-active)", ":host(.active)")
+              .replace(".bk-body", ".body").replace(".bk-bar", ".bar").replace(".bk-knob", ".knob"))
+    return css + old
+
+
+THEME_SWITCH_CSS = _both_names(THEME_SWITCH_CSS).replace("SUN", _SUN_SVG).replace("MOON", _MOON_SVG)
+
+
 # a toggle button that opens a panel (Display, Layers): highlighted while open
 PANEL_TOGGLE_CSS = f"""
 .bk-btn.bk-active {{ background: var(--accent-soft) !important; color: {ACCENT} !important;
