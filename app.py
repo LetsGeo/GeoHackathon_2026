@@ -2539,9 +2539,7 @@ def make_pdf():
     import matplotlib
     matplotlib.use("Agg")
     from matplotlib.backends.backend_pdf import PdfPages
-    from matplotlib.colors import LinearSegmentedColormap
     from matplotlib.figure import Figure
-    from matplotlib.patches import Rectangle
 
     an = ws["analysis"]
     vol, sl, summary = an["volume"], an.get("slice"), an["summary"]
@@ -2550,8 +2548,6 @@ def make_pdf():
     a4 = (8.27, 11.69)
     ink, grey = "#13212a", "#5b6b73"
     stamp = datetime.now().strftime("%d %b %Y, %H:%M")
-    diff_cmap = LinearSegmentedColormap.from_list("diff", [c for _, c in DIFF_STOPS])
-    map_cmap = LinearSegmentedColormap.from_list("map", MAP_PALETTE)
 
     def footer(fig, page):
         if credit:
@@ -2578,7 +2574,7 @@ def make_pdf():
 
     buf = io.BytesIO()
     with PdfPages(buf) as pdf:
-        # page 1: key numbers and the two images
+        # page 1: key numbers
         fig = Figure(figsize=a4)
         fig.text(0.07, 0.95, "4D Seismic Difference Analysis", fontsize=18, weight="bold", color=ink)
         fig.text(0.07, 0.928, f"{base_label} (baseline) vs {mon_label} (monitor) · {stamp}", fontsize=9.5, color=grey)
@@ -2609,46 +2605,7 @@ def make_pdf():
             fig.text(0.07, y, label, fontsize=9.5, color=grey)
             fig.text(0.34, y, value, fontsize=9.5, color=ink)
             y -= 0.021
-
-        top = y - 0.02
-        h = (top - 0.10) / 2 - 0.05
-        ax = fig.add_axes([0.09, top - h, 0.74, h])
-        il, xl, change = vol["map_il"], vol["map_xl"], vol["map"]
-        (x0, x1), (y0, y1) = extent(xl), extent(il)
-        hi = float(np.nanpercentile(change, 99.5)) if np.isfinite(change).any() else 1.0
-        im = ax.imshow(change, origin="lower", extent=(x0, x1, y0, y1), aspect="auto",
-                       cmap=map_cmap, vmin=0, vmax=hi or 1.0, interpolation="nearest")
-        if vol["significant"] and "box" in vol:
-            b0, b1, c0, c1 = vol["box"]
-            ax.add_patch(Rectangle((c0, b0), c1 - c0, b1 - b0, fill=False, ec=MARK_COLOR, lw=1.2, ls="--"))
-        if sl is not None and sl["view"] == "Inline":
-            ax.axhline(sl["pos"], color=MARK_COLOR, lw=1.2)
-        elif sl is not None and sl["view"] == "Crossline":
-            ax.axvline(sl["pos"], color=MARK_COLOR, lw=1.2)
-        ax.set_title("Whole volume · RMS amplitude change (map view)", fontsize=10, color=ink, loc="left")
-        ax.set_xlabel("Crossline", fontsize=8.5)
-        ax.set_ylabel("Inline", fontsize=8.5)
-        ax.tick_params(labelsize=7.5)
-        fig.colorbar(im, cax=fig.add_axes([0.85, top - h, 0.02, h])).ax.tick_params(labelsize=7)
-
-        if sl is not None:
-            ax2 = fig.add_axes([0.09, 0.10, 0.74, h])
-            aligned, diff = sl["aligned"], sl["diff"]
-            x_label, y_label, y_down = VIEW_AXES[sl["view"]]
-            (x0, x1), (y0, y1) = extent(aligned["xs"]), extent(aligned["ys"])
-            lim = float(np.nanpercentile(np.abs(diff), 99)) if np.isfinite(diff).any() else 1.0
-            im2 = ax2.imshow(diff, origin="lower", extent=(x0, x1, y0, y1), aspect="auto",
-                             cmap=diff_cmap, vmin=-(lim or 1), vmax=lim or 1, interpolation="nearest")
-            if y_down:
-                ax2.invert_yaxis()
-            ax2.set_title(f"Current slice · difference ({mon_label} − {base_label}) · "
-                          f"{position_text(sl['view'], sl['pos'])}", fontsize=10, color=ink, loc="left")
-            ax2.set_xlabel(x_label, fontsize=8.5)
-            ax2.set_ylabel(y_label, fontsize=8.5)
-            ax2.tick_params(labelsize=7.5)
-            cb = fig.colorbar(im2, cax=fig.add_axes([0.85, 0.10, 0.02, h]))
-            cb.ax.tick_params(labelsize=7)
-            cb.set_label("− weaker · stronger +", fontsize=7.5)
+        # (the change map and slice difference plots are shown in the app only, not in the PDF)
         footer(fig, 1)
         pdf.savefig(fig)
 
