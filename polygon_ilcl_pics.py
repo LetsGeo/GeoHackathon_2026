@@ -415,3 +415,5 @@ for hex_id, (center_iline, center_xline) in HEXAGONS.items():
 
 print(f"Saved {saved} pictures of {len(HEXAGONS) - len(skipped)} of {len(HEXAGONS)} hexagons in {DIR}"
       + (f" (outside the survey: {', '.join(skipped)})" if skipped else ""))
+# Next: score each hexagon with Gemma (ID + % likelihood of a reservoir):
+#   %run gemma_ilcl.py          (reads the pictures in DIR, writes DIR/gemma/scores.csv)
