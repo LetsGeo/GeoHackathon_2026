@@ -237,11 +237,38 @@ def hexagon(center_iline: int, center_xline: int):
     """
     return np.add(HEX, [center_iline, center_xline])
 
-# Hexagons to picture: ID -> (centre inline, centre crossline), in line numbers (NOT indices).
+
+def hexagon_rings(center_iline: float, center_xline: float, n_rings: int = 2):
+    """One hexagon in the middle with n_rings rings of hexagons around it, all sharing edges
+    (same layout and order as hexagon_rings in polygon.py, but with this file's SCALE).
+    n_rings = 2 -> 1 + 6 + 12 = 19 hexagons, ordered middle first, then ring 1, then ring 2.
+    Returns (centers, ring): centers (N, 2) [iline, xline] of each centre, ring (N,) its ring."""
+    cells = []
+    for q in range(-n_rings, n_rings + 1):
+        for r in range(-n_rings, n_rings + 1):
+            k = max(abs(q), abs(r), abs(q + r))
+            if k <= n_rings:
+                cells.append((k, q, r))
+    cells.sort(key=lambda c: (c[0], np.arctan2(c[2] + c[1] / 2, c[1])))  # by ring, then around the ring
+    ring = np.array([k for k, _, _ in cells])
+    q = np.array([c[1] for c in cells])
+    r = np.array([c[2] for c in cells])
+    centers = np.column_stack([
+        center_iline + 1.5 * SCALE * q,
+        center_xline + 2 * s32 * SCALE * (r + q / 2),
+    ])
+    return centers, ring
+
+
+# All the hexagons in the polygon: 19 = 1 in the middle + a ring of 6 + a ring of 12, centred
+# on the middle hexagon below (line numbers, NOT indices).
+# IDs follow the hexagon_rings order: 0 = middle, 1-6 = ring 1, 7-18 = ring 2.
 # The ID names the pictures: hex<ID>_IL_<inline>.png and hex<ID>_CL_<crossline>.png
-HEXAGONS = {
-    1: (1006, 2412),
-}
+CENTER_ILINE, CENTER_XLINE = 1006, 2412
+N_RINGS = 2
+centers, rings = hexagon_rings(CENTER_ILINE, CENTER_XLINE, N_RINGS)
+HEXAGONS = {hex_id: (float(il), float(xl)) for hex_id, (il, xl) in enumerate(centers)}
+RING = {hex_id: int(k) for hex_id, k in enumerate(rings)}
 N_LINES = 10  # inlines and crosslines per hexagon, spread evenly across it
 
 import matplotlib
@@ -331,13 +358,14 @@ def hex_name(hex_id):
     return f"hex{hex_id:02d}" if isinstance(hex_id, (int, np.integer)) else f"hex{hex_id}"
 
 
-saved = 0
+saved, skipped = 0, []
 for hex_id, (center_iline, center_xline) in HEXAGONS.items():
     corners = hexagon(center_iline, center_xline)
     name = hex_name(hex_id)
-    print(f"{name}: centre inline {center_iline} / crossline {center_xline}")
+    print(f"{name} (ring {RING.get(hex_id, '-')}): centre inline {center_iline:.0f} / crossline {center_xline:.0f}")
     if not lines_across(corners, base_vol.ilines, axis=0) and not lines_across(corners, base_vol.xlines, axis=1):
         print("  no part of this hexagon is inside the survey: skipped")
+        skipped.append(name)
         continue
 
     for il_idx in lines_across(corners, base_vol.ilines, axis=0):
@@ -385,4 +413,5 @@ for hex_id, (center_iline, center_xline) in HEXAGONS.items():
         saved += 1
         print(f'  saved {path}')
 
-print(f"Saved {saved} pictures of {len(HEXAGONS)} hexagon(s) in {DIR}")
+print(f"Saved {saved} pictures of {len(HEXAGONS) - len(skipped)} of {len(HEXAGONS)} hexagons in {DIR}"
+      + (f" (outside the survey: {', '.join(skipped)})" if skipped else ""))
