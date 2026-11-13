@@ -82,17 +82,7 @@ elsewhere.
 |---|---|
 | `assets/Logo.png` | The app logo in the sidebar. |
 | `assets/Gemma.png` | The Gemma icon on the Gemma horizons card. |
-| `horizons/TOP-UTSIRA-DEMO.txt`, `horizons/BASE-UTSIRA-DEMO.txt` | **Synthetic** demo horizons for the Sleipner survey, for trying the Horizons layer. Not real interpretation. |
 | `.gitignore` | Keeps virtual environments, pictures (`*.png`, `*.jpg`), NumPy caches (`*.npy`, `*.npz`) and PDFs out of the repo. |
-
-### Not in the repo (Kept Locally)
-
-| Path | What it is |
-|---|---|
-| `data/` | The baseline and monitor SEG-Y files (hundreds of MB each). Put your surveys here, or anywhere, and point **Data sources** at them. |
-| `cache/` | Created automatically on the first load of each survey. Safe to delete. |
-| `wells/` | Synthetic demo well (`SLEIPNER-DEMO-1.las` with its checkshot and deviation files) for trying the Wells page. |
-| `hexagons/` | Synthetic demo hexagon table (`TEST-HEXAGONS-DEMO.txt`) for `sealing_faults.py`. |
 
 ---
 
