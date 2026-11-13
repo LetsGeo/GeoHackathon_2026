@@ -108,6 +108,23 @@ def trace_attributes(base_vol, mon_vol, k0, k1, max_lag, block=32):
     return disc, drms
 
 
+def reference_levels(disc, drms):
+    """Survey-wide levels from the per-trace maps: robust z of the discontinuity, which traces
+    are on a fault, a per-trace fault probability, and which traces clearly changed in 4D."""
+    d = disc[np.isfinite(disc)]
+    med = float(np.median(d)) if d.size else 0.0
+    mad = (float(np.median(np.abs(d - med)) * 1.4826) if d.size else 0.0) or 1e-6
+    z = (disc - med) / mad
+    flag = np.isfinite(z) & (z > FAULT_Z)
+    with np.errstate(over="ignore", invalid="ignore"):
+        p_trace = 1 / (1 + np.exp(-(z - FAULT_Z)))       # per-trace fault probability
+    ad = np.abs(drms)
+    noise = float(np.nanmedian(ad)) if np.isfinite(ad).any() else 0.0  # typical |RMS change| = non-repeatability
+    spread = float(np.nanmedian(np.abs(ad - noise)) * 1.4826) if np.isfinite(ad).any() else 0.0
+    changed = np.isfinite(ad) & (ad > noise + CHANGE_Z * max(spread, 1e-12))  # traces that clearly changed
+    return z, flag, p_trace, changed
+
+
 # ---------------------------------------------------------------------------
 # Per-hexagon table
 # ---------------------------------------------------------------------------
@@ -203,18 +220,7 @@ def main(base_vol=None, mon_vol=None, out_dir=OUT_DIR, window=WINDOW, center=(CE
           f"({len(base_vol.ilines)} x {len(base_vol.xlines)} traces)...")
     disc, drms = trace_attributes(base_vol, mon_vol, k0, k1, max_lag)
 
-    # survey-wide reference levels
-    d = disc[np.isfinite(disc)]
-    med = float(np.median(d))
-    mad = float(np.median(np.abs(d - med)) * 1.4826) or 1e-6
-    z = (disc - med) / mad
-    flag = np.isfinite(z) & (z > FAULT_Z)
-    with np.errstate(over="ignore", invalid="ignore"):
-        p_trace = 1 / (1 + np.exp(-(z - FAULT_Z)))       # per-trace fault probability
-    ad = np.abs(drms)
-    noise = float(np.nanmedian(ad))                       # typical |RMS change| = non-repeatability
-    spread = float(np.nanmedian(np.abs(ad - noise)) * 1.4826)
-    changed = np.isfinite(ad) & (ad > noise + CHANGE_Z * max(spread, 1e-12))  # traces that clearly changed
+    z, flag, p_trace, changed = reference_levels(disc, drms)  # survey-wide reference levels
     line_step = float(np.median(np.diff(base_vol.ilines))) if len(base_vol.ilines) > 1 else 1.0
     print(f"  {flag.sum()} traces on a fault ({100 * flag.mean():.2f}% of the survey); "
           f"{changed.sum()} traces with clear 4D change ({100 * changed.mean():.2f}%)")

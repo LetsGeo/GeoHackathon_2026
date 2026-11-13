@@ -2154,6 +2154,8 @@ def rebuild(event=None):
     try:
         cfg = current_config()
         reset_analysis()
+        if "hex_card" in globals():
+            hex_card.reset()
         detach_views()
         finish_rebuild(load_surveys(cfg), event)
     finally:
@@ -2175,6 +2177,8 @@ async def on_run_click(event=None):
     try:
         cfg = current_config()
         reset_analysis()
+        if "hex_card" in globals():
+            hex_card.reset()
         detach_views()
         await asyncio.sleep(0.05)  # lets the browser draw the overlay before the heavy part starts
         surveys = await asyncio.get_running_loop().run_in_executor(None, load_surveys, cfg)
@@ -2441,7 +2445,8 @@ AI_SECTIONS = [
     ("opportunity", "Opportunity score", "Skor peluang"),
     ("volume", "Hydrocarbon volume", "Isipadu hidrokarbon"),
 ]
-AI_PLACEHOLDER = {"en": "To be provided by the AI analysis.", "ms": "Akan disediakan oleh analisis AI."}
+AI_PLACEHOLDER = {"en": "Run the hexagon analysis below to fill this in.",
+                  "ms": "Jalankan analisis heksagon di bawah untuk mengisi bahagian ini."}
 
 
 def other_findings(vol):
@@ -2790,7 +2795,8 @@ def render_analysis(force=False):
     sl = current_slice_analysis()
     an["slice"] = sl
     base_label, mon_label = an["labels"]
-    an["summary"] = write_summary(an["volume"], sl, base_label, mon_label)
+    an["summary"] = write_summary(an["volume"], sl, base_label, mon_label,
+                                  ai=(ws.get("hexagons") or {}).get("texts"))  # the hexagon analysis' sections
     ws["afigs"] = []
     plots = [change_map_plot(an["volume"], sl)]
     if sl is not None:
@@ -2950,6 +2956,8 @@ def make_pdf():
             text_page(fig, title, sections, note)
             footer(fig, page)
             pdf.savefig(fig)
+        if ws.get("hexagons"):  # the hexagon analysis: map + table
+            hex_card.pdf_pages(pdf, footer, len(pages) + 2, stamp)
     buf.seek(0)
     return buf
 
@@ -2993,7 +3001,7 @@ load_btn.on_click(on_run_click)
 
 def on_theme_change(event):
     ws["theme"] = "light" if event.new else "dark"
-    for p in ws["figs"] + ws["afigs"] + ws["wfigs"]:
+    for p in ws["figs"] + ws["afigs"] + ws["wfigs"] + ws.get("hfigs", []):
         style_figure(p)
 
 
@@ -3364,6 +3372,9 @@ def overview_table_html():
     rows.append(_row(ICON_ANALYSIS, "Analysis", "baseline vs monitor, rule-based",
                      "Done" if an else "Not run", "ok" if an else "warn",
                      f'{an["volume"]["changed_pct"]:.1f}% of the area changed' if an else ""))
+    if "hex_card" in globals():
+        name, detail, pill, cls, info = hex_card.overview_row()
+        rows.append(_row(ICON_ANALYSIS, name, detail, pill, cls, info))
     return ('<table class="overview"><thead><tr><th>Item</th><th>Details</th>'
             '<th style="text-align:right">Status</th></tr></thead><tbody>' + "".join(rows) + "</tbody></table>")
 
@@ -3410,6 +3421,12 @@ class _Live:
 import wells  # noqa: E402
 
 wells_ui = wells.WellsPage(_Live(globals()))
+
+# Hexagon analysis (hexagon_ui.py / hexagon_analysis.py): the report's three AI sections
+import hexagon_ui  # noqa: E402
+
+hex_card = hexagon_ui.HexagonCard(_Live(globals()))
+analysis_page.append(hex_card.layout)
 wells_ui.well_select.param.watch(lambda event: refresh_overlay(), "value")  # hexagons follow the chosen well
 
 
@@ -3428,6 +3445,7 @@ def show_page(page):
                             (analysis_page, analysis_page[0], analysis_card)):
         empty.visible = not has_data
         body.visible = has_data
+    hex_card.layout.visible = has_data
     overview_page.visible = page == "overview"
     viewer_page.visible = page == "viewer"
     analysis_page.visible = page == "analysis"

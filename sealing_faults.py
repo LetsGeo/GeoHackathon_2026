@@ -306,7 +306,7 @@ def rule_engine(cells):
 
 
 SYSTEM_PROMPT = """You are a structural geologist assessing fault seal around a well from 3D seismic.
-The area around the well is split into hexagons (about 250 m across). For each hexagon you get:
+The area around the well is split into hexagons (about HEX_ACROSS inlines across). For each hexagon you get:
 - sealing_fault_probability_pct: the fault attribute's probability (0-100) that a sealing fault is in it
 - trace_pct: the percentage of the hexagon's seismic traces where that fault is picked up (how much of it the fault covers)
 - distance and direction from the well, and its ring around the well (0 = the well's own hexagon)
@@ -320,6 +320,7 @@ Judge every hexagon. Reply with one JSON object only, no other text:
 {"hexagons": [{"hexagon": <number>, "verdict": "likely" | "possible" | "unlikely",
   "confidence": <0 to 1>, "reason": "<one short sentence with the numbers that decided it>"}],
  "summary": "<two or three sentences: where the sealing fault(s) most likely are relative to the well, and how sure you are>"}"""
+SYSTEM_PROMPT = SYSTEM_PROMPT.replace("HEX_ACROSS", f"{2 * polygon.SCALE:g}")  # hexagon size from polygon.py
 
 
 def ask_gemma(cells, well_info, horizon_names):

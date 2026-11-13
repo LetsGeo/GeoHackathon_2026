@@ -48,17 +48,38 @@ def gemma_reachable(timeout_s=3):
         return False
 
 
-def gemma_chat(system, user, max_tokens=800, temperature=0.1):
+def gemma_chat(system, user, max_tokens=800, temperature=0.1, timeout_s=None):
     """Ask Gemma once and return its reply text. Needs `pip install openai`;
-    raises if the package is missing or the server can't be reached."""
+    raises if the package is missing or the server can't be reached.
+    timeout_s: give up after this long (default GEMMA_TIMEOUT_S); longer for big replies."""
     import openai
     if not gemma_reachable():
         raise ConnectionError(f"the Gemma server ({GEMMA_URL}) isn't reachable from this computer")
     client = openai.OpenAI(base_url=GEMMA_URL, api_key="token-not-needed",
-                           timeout=GEMMA_TIMEOUT_S, max_retries=0)
+                           timeout=timeout_s or GEMMA_TIMEOUT_S, max_retries=0)
     reply = client.chat.completions.create(
         model=GEMMA_MODEL, temperature=temperature, max_tokens=max_tokens,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
+    return reply.choices[0].message.content
+
+
+GEMMA_IMAGE_TIMEOUT_S = 120  # a picture takes longer than text, more so with several sent at once
+
+
+def gemma_chat_image(system, text, image_url, max_tokens=600, temperature=0.1, check=True):
+    """Ask Gemma about one picture (image_url: a data:image/png;base64,... URL) and return its
+    reply text. check=False skips the reachability check (when the caller just did it, e.g.
+    before sending many pictures). Raises like gemma_chat."""
+    import openai
+    if check and not gemma_reachable():
+        raise ConnectionError(f"the Gemma server ({GEMMA_URL}) isn't reachable from this computer")
+    client = openai.OpenAI(base_url=GEMMA_URL, api_key="token-not-needed",
+                           timeout=GEMMA_IMAGE_TIMEOUT_S, max_retries=0)
+    reply = client.chat.completions.create(
+        model=GEMMA_MODEL, temperature=temperature, max_tokens=max_tokens,
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": [{"type": "text", "text": text},
+                                               {"type": "image_url", "image_url": {"url": image_url}}]}])
     return reply.choices[0].message.content
 
 
