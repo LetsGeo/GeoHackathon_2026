@@ -1,7 +1,7 @@
 import numpy as np
 
 s32 = np.sqrt(3) / 2
-SCALE = 10  # Number of ilines/xlines for desired size, hardcoded to 10 for ~250m, ignoring non-square il/xl
+SCALE = 110  # Hexagon radius in ilines/xlines (ignoring non-square il/xl); same as polygon_ilcl_pics.py, hex_rms.py, hex_table.py
 HEX = np.array([[1, 0], [0.5, -s32], [-0.5, -s32], [-1, 0], [-0.5, s32], [0.5, s32]]) * SCALE
 
 
