@@ -1,0 +1,6 @@
+**/venv/
+*.png
+*.npy
+*.npz
+*.jpg
+*.pdf
