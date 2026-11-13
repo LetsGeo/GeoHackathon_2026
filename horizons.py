@@ -153,6 +153,7 @@ class HorizonLayer:
         app.ws.setdefault("horizons", [])
         self.visible = True
         self.renderers = []          # everything drawn for horizons, so the Show toggle can hide it
+        self.draw_tools = []         # the Draw horizon tools (hidden on time slices)
         self.src = None              # this build's plot sources
         self._updating = False       # True while the app (not the user) changes the drawn-horizon source
         self._pending = []           # horizons drawn on this section whose plot rows don't carry an id yet
@@ -288,6 +289,7 @@ class HorizonLayer:
     def new_build(self):
         """Fresh plot sources for a rebuild of the workspace plots (call before attach)."""
         self.renderers = []
+        self.draw_tools = []
         self._pending = []
         self.src = {
             "lines": ColumnDataSource({"xs": [], "ys": [], "name": [], "colour": []}),
@@ -310,17 +312,26 @@ class HorizonLayer:
                           background_fill_color="white", background_fill_alpha=0.75)
         p.add_layout(labels)
         rs.append(labels)
-        if editable and view != "Time slice":
+        if editable:
             vertices = p.scatter("x", "y", source=ColumnDataSource({"x": [], "y": []}), size=7,
                                  fill_color="white", line_color=DRAWN_HORIZON_COLOUR, line_width=2)
             rs.append(vertices)
-            p.add_tools(PolyDrawTool(renderers=[rs[1]], vertex_renderer=vertices, drag=True, empty_value="",
-                                     icon=ICON_HORIZON,
-                                     description="Draw horizon (hold to start, click along the reflector, "
-                                                 "hold or Esc to finish; click it + Backspace to delete)"))
+            # always added, but only shown on inline / crossline sections (the app keeps the
+            # same plots when the view changes, so the tool is switched, not re-created)
+            tool = PolyDrawTool(renderers=[rs[1]], vertex_renderer=vertices, drag=True, empty_value="",
+                                icon=ICON_HORIZON, visible=view != "Time slice",
+                                description="Draw horizon (hold to start, click along the reflector, "
+                                            "hold or Esc to finish; click it + Backspace to delete)")
+            p.add_tools(tool)
+            self.draw_tools.append(tool)
         for r in rs:
             r.visible = self.visible
         self.renderers += rs
+
+    def set_view(self, view):
+        """The view changed on the same plots: show the Draw horizon tool on sections only."""
+        for tool in self.draw_tools:
+            tool.visible = view != "Time slice"
 
     def set_visible(self, visible):
         self.visible = visible

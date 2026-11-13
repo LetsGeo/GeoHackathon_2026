@@ -25,6 +25,7 @@ import functools
 import gc
 import hashlib
 import io
+import json
 import os
 import re
 import struct
@@ -50,11 +51,15 @@ sys.path.insert(0, str(Path(__file__).parent))  # so the app's own modules are f
 from shapefiles import SHAPE_EXTS, closed_ring, read_dbf, read_shp, record_label, write_shapefile  # noqa: E402
 from styles import *  # noqa: E402,F401,F403  (colours, fonts, CSS, icons: see styles.py)
 import horizons  # noqa: E402  (horizons loaded from files or drawn on sections)
+import polygon  # noqa: E402  (the 19-hexagon grid drawn on time slices)
 from loading import LoadingOverlay  # noqa: E402  (full-screen pumpjack overlay while Run works)
+from ai import suggest_horizons, translate_texts  # noqa: E402  (Gemma: summary translations, horizon picks)
 from types import SimpleNamespace  # noqa: E402
 
 LOGO_PATH = Path(__file__).parent / "assets" / "Logo.png"
 LOGO_SRC = "data:image/png;base64," + base64.b64encode(LOGO_PATH.read_bytes()).decode()
+GEMMA_LOGO_SRC = ("data:image/png;base64,"  # the Gemma horizons card's icon
+                  + base64.b64encode((Path(__file__).parent / "assets" / "Gemma.png").read_bytes()).decode())
 
 # ---------------------------------------------------------------------------
 # Page set-up: the font and the theme colours (defined in styles.py)
@@ -879,7 +884,12 @@ def make_view_png(view):
         im = ax.imshow(sl["img"], origin="lower", extent=(x0, x1, y0, y1), aspect="auto", cmap=cmap, norm=norm)
         image = im if image is None else image
 
-        # polygons, then everything else drawn on the plots (same styling as the screen)
+        # hexagon grid, polygons, then everything else drawn on the plots (same styling as the screen)
+        hex_c = mpl_colour(HEX_COLOUR)
+        hx = hexagon_data(view, pos)
+        for xs, ys in zip(hx["xs"], hx["ys"]):
+            ax.add_patch(Polygon(np.column_stack([xs, ys]), closed=True, facecolor=(*hex_c[:3], 0.08),
+                                 edgecolor=hex_c, linewidth=1.2))
         for xs, ys, _ in finished_shapes(view):
             ax.add_patch(Polygon(np.column_stack([xs, ys]), closed=True, facecolor=(*shape_c[:3], 0.15),
                                  edgecolor=shape_c, linewidth=2))
@@ -895,6 +905,12 @@ def make_view_png(view):
             ax.annotate(t, (x, y), xytext=(6, -5), textcoords="offset points", va="top", ha="left",
                         fontsize=8, weight="bold", color="#0b1418", zorder=6,
                         bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none", "pad": 1.5})
+        wd = well_dot_data(view, pos)  # wells on time slices
+        for x, y, n, c in zip(wd["x"], wd["y"], wd["name"], wd["colour"]):
+            ax.scatter([x], [y], s=90, color=mpl_colour(c), edgecolors="white", linewidths=2, zorder=7)
+            ax.annotate(n, (x, y), xytext=(7, 5), textcoords="offset points", va="bottom", ha="left",
+                        fontsize=8, weight="bold", color="#0b1418", zorder=8,
+                        bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "none", "pad": 1.5})
 
         if ranges is not None:
             ax.set_xlim(ranges[0].start, ranges[0].end)
@@ -1109,6 +1125,55 @@ def compute_overlay(view, pos, t_range):
     return out
 
 
+HEX_COLOUR = "#ffb000"  # the hexagon grid on time slices
+
+
+def hexagon_well():
+    """The well the hexagons go on: the one chosen on the Wells page, else the first loaded (None if no wells)."""
+    loaded = ws.get("wells") or []
+    ui = globals().get("wells_ui")
+    chosen = ui.well_select.value if ui is not None else None
+    return next((w for w in loaded if w["name"] == chosen), loaded[0] if loaded else None)
+
+
+def well_at_time(well, t):
+    """(inline, crossline) of a well at time t ms. A deviated well is followed down its
+    path; above its first point it's taken at its top, below its last point at its end.
+    A well with no times (a vertical well placed by line numbers) is at its top."""
+    il, xl, twt = well["il"], well["xl"], well.get("twt")
+    if twt is None or len(twt) < 2:
+        return float(il[0]), float(xl[0])
+    return float(np.interp(t, twt, il)), float(np.interp(t, twt, xl))
+
+
+def hexagon_data(view, pos=None):
+    """The 19 hexagons (1 in the middle, rings of 6 and 12) as plot data, with the
+    middle one on the well where it crosses this time slice. Only on the Time slice
+    view (x = crossline, y = inline), and only once a well is loaded."""
+    well = hexagon_well() if view == "Time slice" else None
+    if well is None:
+        return {"xs": [], "ys": [], "ring": []}
+    pos = position_input.value if pos is None else pos
+    c_il, c_xl = well_at_time(well, pos)
+    _, hexes, ring = polygon.hexagon_rings(c_il, c_xl)  # hexagon corners are [iline, xline]
+    return {"xs": [h[:, 1].tolist() for h in hexes], "ys": [h[:, 0].tolist() for h in hexes],
+            "ring": ring.tolist()}
+
+
+def well_dot_data(view, pos=None):
+    """A dot per loaded well where it crosses this time slice, in the well's own
+    colour (Time slice view only: x = crossline, y = inline)."""
+    out = {"x": [], "y": [], "name": [], "colour": []}
+    if view != "Time slice":
+        return out
+    pos = position_input.value if pos is None else pos
+    for w in ws.get("wells") or []:
+        il, xl = well_at_time(w, pos)
+        out["x"].append(xl), out["y"].append(il)
+        out["name"].append(w["name"]), out["colour"].append(w.get("colour") or FEATURE_COLOUR)
+    return out
+
+
 def refresh_overlay():
     srcs = ws.get("overlay_src")
     if not srcs:
@@ -1118,6 +1183,10 @@ def refresh_overlay():
     data = compute_overlay(view, pos, ws.get("t_range") if view != "Time slice" else None)
     for key, src in srcs.items():
         src.data = data[key]
+    if ws.get("hex_src") is not None:
+        ws["hex_src"].data = hexagon_data(view, pos)
+    if ws.get("well_dot_src") is not None:
+        ws["well_dot_src"].data = well_dot_data(view, pos)
 
 
 def place_ring(xs, ys, view, view_from_file=False):
@@ -1322,6 +1391,9 @@ def add_shape_layer(p, image_renderer, src, overlay, editable):
     for hover in p.select(type=HoverTool):
         hover.renderers = [image_renderer]  # seismic tooltip only on the seismic
     drawn = ws.setdefault("shape_renderers", [])
+    if ws.get("hex_src") is not None:  # the hexagon grid, under everything else (empty off time slices)
+        drawn.append(p.patches("xs", "ys", source=ws["hex_src"], fill_color=HEX_COLOUR, fill_alpha=0.08,
+                               line_color=HEX_COLOUR, line_width=1.5, line_alpha=0.9))
     drawn += [
         p.multi_line("xs", "ys", source=overlay["marks"], line_color=FEATURE_COLOUR, line_width=1.5,
                      line_dash="dashed", line_alpha=0.85),
@@ -1342,6 +1414,15 @@ def add_shape_layer(p, image_renderer, src, overlay, editable):
                         nonselection_fill_alpha=0.1, nonselection_line_alpha=0.6,
                         nonselection_line_color=SHAPE_COLOUR, nonselection_fill_color=SHAPE_COLOUR)
     drawn += [labels, patches]
+    if ws.get("well_dot_src") is not None:  # wells on time slices, on top of everything so they're easy to spot
+        dots = ws["well_dot_src"]
+        drawn.append(p.scatter("x", "y", source=dots, size=13, marker="circle", fill_color="colour",
+                               line_color="white", line_width=2.5))
+        well_names = LabelSet(x="x", y="y", text="name", source=dots, x_offset=9, y_offset=6,
+                              text_font_size="10.5px", text_color="#0b1418", text_font_style="bold",
+                              background_fill_color="white", background_fill_alpha=0.8)
+        p.add_layout(well_names)
+        drawn.append(well_names)
     if not editable:
         return
     vertices = p.scatter("x", "y", source=ColumnDataSource({"x": [], "y": []}), size=8,
@@ -1396,9 +1477,10 @@ show_select = pn.widgets.RadioButtonGroup(options=SHOW_OPTIONS, value="Both", st
 
 def apply_overlay_visibility(event=None):
     show = show_select.value
+    on_map = view_select.value == "Time slice"  # no horizons on time slices: the Show toggle is hidden there
     for r in ws.get("shape_renderers", []):
-        r.visible = show in ("Polygons", "Both")
-    horizons_ui.set_visible(show in ("Horizons", "Both"))
+        r.visible = on_map or show in ("Polygons", "Both")
+    horizons_ui.set_visible(not on_map and show in ("Horizons", "Both"))
 
 
 show_select.param.watch(apply_overlay_visibility, "value")
@@ -1608,7 +1690,10 @@ def card_header(title, role, sub):
 MORPH_COMMON_JS = """
 const apply = () => {
   const t = state.data.t[0];
-  const img = src.data.image[0], base = src.data.base[0], diff = src.data.diff[0];
+  const img = src.data.image[0], diff = src.data.diff[0];
+  // a new slice arrives as the baseline image: keep a copy of it to blend from
+  if (state._img !== img) { state._img = img; state._base = Float32Array.from(img); }
+  const base = state._base;
   for (let i = 0; i < img.length; i++) img[i] = base[i] + t * diff[i];
   src.change.emit();
   plot.title.text = `${a_label}  →  ${b_label}   ·   ${Math.round(t * 100)}%`;
@@ -1639,11 +1724,11 @@ MORPH_DATA_JS = MORPH_COMMON_JS + "apply();"  # new slice arrived: redraw at the
 
 
 def morph_data(a_slice, b_slice, y_is_time):
+    """The morph's data: the baseline image and the difference. (The browser keeps
+    its own copy of the baseline for blending, so it isn't sent twice.)"""
     aligned, diff = align2d(a_slice, b_slice, y_is_time)
     data = image_data(aligned)
-    data["base"] = [aligned["img"]]
     data["diff"] = [diff]
-    data["image"] = [aligned["img"].copy()]
     return data
 
 
@@ -1773,12 +1858,16 @@ def build_views():
     # one shape source shared by every plot: draw on one survey, it shows on all
     shapes = ws["shapes"][view]
     shape_src = ColumnDataSource(shape_columns(shapes))
-    shape_src.on_change("data", functools.partial(on_shapes_edited, view))
+    ws["shape_view"] = view  # which view's shapes the source holds (the plots are kept across view changes)
+    shape_src.on_change("data", lambda attr, old, new: on_shapes_edited(ws["shape_view"], attr, old, new))
     ws["shape_src"] = shape_src
     overlay = new_overlay_sources()  # uploaded points / lines, and map shapes cut by this section
     ws["overlay_src"] = overlay
+    ws["hex_src"] = ColumnDataSource(hexagon_data(view))
+    ws["well_dot_src"] = ColumnDataSource(well_dot_data(view))
     ws["shape_renderers"] = []
     horizons_ui.new_build()
+    ws["gemma_src"] = ColumnDataSource({"xs": [], "ys": [], "colour": [], "alpha": [], "width": []})
 
     ws["cards"] = []
     cards = []
@@ -1795,8 +1884,9 @@ def build_views():
             img = p.image(image="image", x="x", y="y", dw="dw", dh="dh", source=src, color_mapper=mapper)
             add_shape_layer(p, img, shape_src, overlay, editable=True)
             horizons_ui.attach(p, editable=True, view=view)
+            gemma_attach(p)
             body =[pn.pane.Bokeh(p, sizing_mode="stretch_width", margin=(10, 0, 0, 0)), credit_html(credit)]
-            ws["cards"].append({"survey": survey, "src": src, "sub": sub_pane})
+            ws["cards"].append({"survey": survey, "src": src, "sub": sub_pane, "fig": p})
         elif survey["error"]:
             body = [message_box(f'Couldn\'t load {survey["name"]}', survey["error"], error=True)]
         else:
@@ -1825,6 +1915,7 @@ def build_views():
             img = p.image(image="image", x="x", y="y", dw="dw", dh="dh", source=src, color_mapper=mapper)
             add_shape_layer(p, img, shape_src, overlay, editable=False)
             horizons_ui.attach(p, editable=False, view=view)
+            gemma_attach(p)
             state = ColumnDataSource({"t": [0.0]})
             play_btn = BkButton(label="▶  Play", stylesheets=[MORPH_BTN_CSS, MORPH_PLAY_CSS])
             restart_btn = BkButton(label="↺  Restart", stylesheets=[MORPH_BTN_CSS])
@@ -1836,7 +1927,7 @@ def build_views():
             m_body = [pn.pane.Bokeh(p, sizing_mode="stretch_width", margin=(10, 0, 0, 0)),
                       pn.Row(pn.layout.HSpacer(), play_btn, restart_btn,  # right-aligned
                              sizing_mode="stretch_width", margin=(10, 0, 0, 0)), credit_html(credit)]
-            ws["morph"] = {"src": src}
+            ws["morph"] = {"src": src, "fig": p}
     morph = pn.Column(m_head, *[b for b in m_body if b is not None],
                       sizing_mode="stretch_width", styles=CARD_STYLES, margin=(8, 0))
 
@@ -1846,12 +1937,14 @@ def build_views():
     horizons_ui.refresh()
     apply_overlay_visibility()
     apply_colours()
+    gemma_preview()
+    gemma_refresh_button()
     render_analysis()
 
 
 def update_slice(event=None):
     """Changing the slice number: swap the images in place (no rebuild)."""
-    if not ws["surveys"]:
+    if not ws["surveys"] or ws.get("switching"):
         return
     view, pos = view_select.value, position_input.value
     _, _, y_down = VIEW_AXES[view]
@@ -1869,6 +1962,7 @@ def update_slice(event=None):
             pass
     refresh_overlay()  # map shapes cut by the new section
     horizons_ui.refresh()
+    gemma_section_changed()
     render_analysis()
 
 
@@ -1895,13 +1989,74 @@ def detach_views():
     that follow don't try to redraw plots that are about to be removed."""
     colour_mappers.clear()
     ws["cards"], ws["morph"], ws["shape_src"], ws["overlay_src"], ws["ranges"] = [], None, None, None, None
+    ws["hex_src"] = ws["well_dot_src"] = None
     ws["figs"] = []
 
 
+def set_view_range(r, lo, hi, flip=False):
+    """Point an existing axis range at new limits (what view_range() gives a new plot)."""
+    pad = 0.3 * (hi - lo)
+    r.update(bounds=None, max_interval=None)  # lift the old limits first, so the new start / end fit
+    start, end = (hi, lo) if flip else (lo, hi)
+    r.update(start=start, end=end, reset_start=start, reset_end=end)
+    r.update(bounds=(lo - pad, hi + pad), max_interval=hi - lo)
+
+
+def update_views_in_place():
+    """Switch Inline / Crossline / Time slice on the plots already on screen: new
+    images, axes and labels, but the same plots. Much quicker than building new
+    ones (no new plots to create, send and lay out in the browser). Returns False
+    when the plots can't simply be updated (a survey missing, or no plots yet)."""
+    cards, morph, ranges = ws.get("cards") or [], ws.get("morph"), ws.get("ranges")
+    if len(cards) != 2 or morph is None or ranges is None:
+        return False
+    view, pos = view_select.value, position_input.value
+    x_label, y_label, y_down = VIEW_AXES[view]
+    slices = [get_slice(c["survey"]["vol"], view, pos) for c in cards]
+    try:
+        mdata = morph_data(slices[0], slices[1], y_down)
+    except ValueError:
+        return False  # the surveys don't overlap here: the full rebuild shows the message
+    x0 = min(extent(sl["xs"])[0] for sl in slices)
+    x1 = max(extent(sl["xs"])[1] for sl in slices)
+    y0 = min(extent(sl["ys"])[0] for sl in slices)
+    y1 = max(extent(sl["ys"])[1] for sl in slices)
+    shared_x, shared_y = ranges
+    set_view_range(shared_x, x0, x1)
+    set_view_range(shared_y, y0, y1, flip=y_down)
+    ws["t_range"] = (y0, y1)
+    for p in [c["fig"] for c in cards] + [morph["fig"]]:
+        p.xaxis.axis_label, p.yaxis.axis_label = x_label, y_label
+        for hover in p.select(type=HoverTool):
+            hover.tooltips = [(x_label, "$x{0}"), (y_label, "$y{0}"), ("Amplitude", "@image{0.000}")]
+    for card, sl in zip(cards, slices):
+        card["src"].data = image_data(sl)
+        card["sub"].object = f'<div class="sub">{card["survey"]["name"]} · {position_text(view, sl["pos"])}</div>'
+    morph["src"].data = mdata
+    # this view's shapes, overlays and horizons on the same plots
+    ws["shape_view"] = view
+    ws["shape_src"].data = shape_columns(ws["shapes"][view])
+    refresh_shape_controls()
+    refresh_overlay()
+    horizons_ui.set_view(view)
+    horizons_ui.refresh()
+    apply_overlay_visibility()
+    gemma_preview()
+    render_analysis()
+    return True
+
+
 def on_view_change(event):
-    detach_views()
-    setup_slider(event.new)
-    build_views()
+    ws["switching"] = True  # setting the slice number below mustn't redraw anything on its own
+    try:
+        setup_slider(event.new)
+    finally:
+        ws["switching"] = False
+    if not update_views_in_place():
+        detach_views()
+        build_views()
+    gemma_section_changed()
+    apply_view_layers()
 
 
 def current_config():
@@ -1941,6 +2096,25 @@ def summary_cards_html():
 stats_pane = html("", sizing_mode="stretch_width", margin=(0, 0, 8, 0))
 
 
+def warm_up_cubes(surveys):
+    """Read each loaded cube once, in the background, so the operating system keeps it
+    in memory. Otherwise the first time slice (which cuts across the whole file) has
+    to come from disk and takes a second or two. Changes nothing in the app."""
+    import threading
+
+    def read_all():
+        for s_ in surveys:
+            cube = s_["vol"]["cube"] if s_["vol"] is not None else None
+            if cube is None:
+                continue
+            try:
+                for i in range(0, cube.shape[0], 8):
+                    np.asarray(cube[i:i + 8]).sum()  # touch the data; the result isn't needed
+            except Exception:
+                return  # only a speed-up: never matters if it can't finish
+    threading.Thread(target=read_all, daemon=True).start()
+
+
 def finish_rebuild(surveys, event=None):
     """Second half of loading: show the loaded surveys and (re)build every view."""
     ws["surveys"] = surveys
@@ -1954,6 +2128,7 @@ def finish_rebuild(surveys, event=None):
         show_page(ws["page"])  # the pages that need data show their empty state again
         return
     load_status.object = '<span class="status ok">Loaded</span>'
+    warm_up_cubes(ws["surveys"])
     reset_range_slider()
     first_value = INLINE if (view_select.value == "Inline" and INLINE is not None and event is None) else None
     setup_slider(view_select.value, first_value)
@@ -2457,32 +2632,161 @@ def slice_difference_plot(sl, mon_label, base_label):
                                 f"{position_text(sl['view'], sl['pos'])}")
 
 
+# ---------------------------------------------------------------------------
+# Second summary language: Malay is written by the app itself (works offline);
+# Chinese and Tamil are translated from the English summary by Gemma, in the
+# background, and remembered so each text is only translated once.
+# ---------------------------------------------------------------------------
+SUMMARY_LANGS = {  # code: (button label, column title, language name sent to Gemma)
+    "ms": ("Bahasa Melayu", "Bahasa Melayu", None),
+    "zh": ("中文", "中文 (简体)", "Simplified Chinese"),
+    "ta": ("தமிழ்", "தமிழ்", "Tamil"),
+}
+summary_lang = pn.widgets.RadioButtonGroup(options={v[0]: k for k, v in SUMMARY_LANGS.items()}, value="ms",
+                                           stylesheets=[TOGGLE_CSS], margin=0, align="center")
+_translations = {}  # (lang, English texts) -> translated summary, or {"error": message}
+_translating = set()
+
+
+def english_texts(en):
+    """The English summary as plain texts for Gemma to translate."""
+    return {"title": "Summary", "headings": [h for h, _ in en["sections"]],
+            "sections": [t or AI_PLACEHOLDER["en"] for _, t in en["sections"]],
+            "placeholder": "Placeholder", "other_heading": "Other findings",
+            "other": en["other"] or "", "note": en["note"] or ""}
+
+
+def translation_key(lang, en):
+    return lang, json.dumps(english_texts(en), ensure_ascii=False, sort_keys=True)
+
+
+def translated_summary(lang, en):
+    """The English summary in `lang` from Gemma's translation, in write_summary's
+    shape (plus "other_heading"); None while it's still being translated."""
+    got = _translations.get(translation_key(lang, en))
+    if got is None or "error" in got:
+        return got
+    sections = [(h, None if t is None else got["sections"][i])
+                for i, (h, t) in enumerate(zip(got["headings"], [t for _, t in en["sections"]]))]
+    return {"sections": sections, "other": got["other"] or None, "note": got["note"],
+            "other_heading": got["other_heading"], "placeholder": got["sections"],
+            "badge": got["placeholder"]}
+
+
+def request_translation(lang, en):
+    """Ask Gemma for this translation in the background (once); the summary is
+    redrawn when it arrives."""
+    key = translation_key(lang, en)
+    if key in _translations or key in _translating:
+        return
+    _translating.add(key)
+    texts, language = english_texts(en), SUMMARY_LANGS[lang][2]
+    doc = pn.state.curdoc
+
+    def finish(result):
+        _translations[key] = result
+        _translating.discard(key)
+        refresh_summary()
+
+    async def work():
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(None, translate_texts, texts, language)
+        except Exception as exc:  # unreachable server, bad reply...: say so in the column
+            result = {"error": str(exc)}
+        doc.add_next_tick_callback(lambda: finish(result))
+
+    if doc is not None and doc.session_context is not None:
+        asyncio.get_event_loop().create_task(work())
+    else:  # no browser session (e.g. a test script): translate right away
+        try:
+            finish(translate_texts(texts, language))
+        except Exception as exc:
+            finish({"error": str(exc)})
+
+
+def summary_column(title, s_, h_other, placeholder, badge="Placeholder"):
+    parts = []
+    for i, (heading, text) in enumerate(s_["sections"]):
+        if text:
+            parts.append(f"<h4>{escape(heading)}</h4><p>{escape(text)}</p>")
+        else:
+            ph = placeholder[i] if isinstance(placeholder, list) else placeholder
+            parts.append(f'<h4>{escape(heading)} <span class="ai-badge">{escape(badge)}</span></h4>'
+                         f'<p class="ai-placeholder">{escape(ph)}</p>')
+    if s_["other"]:
+        parts.append(f"<h4>{escape(h_other)}</h4><p>{escape(s_['other'])}</p>")
+    note = f'<p class="sum-note">{escape(s_["note"])}</p>' if s_["note"] else ""  # skip an empty note
+    return f'<div class="sum-col"><div class="sum-lang">{escape(title)}</div>{"".join(parts)}{note}</div>'
+
+
+def second_column(summary, lang):
+    """The second summary column, in the chosen language."""
+    title = SUMMARY_LANGS[lang][1]
+    if lang == "ms":
+        return summary_column(title, summary["ms"], "Penemuan lain", AI_PLACEHOLDER["ms"])
+    tr = translated_summary(lang, summary["en"])
+    if tr is None:
+        request_translation(lang, summary["en"])
+        tr = translated_summary(lang, summary["en"])  # already there if it finished straight away
+    if tr is None:
+        return (f'<div class="sum-col"><div class="sum-lang">{escape(title)}</div>'
+                '<p class="ai-placeholder">Translating with Gemma…</p></div>')
+    if "error" in tr:
+        return (f'<div class="sum-col"><div class="sum-lang">{escape(title)}</div>'
+                f'<p class="status err">Couldn\'t translate with Gemma: {escape(tr["error"])}</p>'
+                '<p class="sum-note">Gemma is only reachable on the hackathon network. Bahasa Melayu works '
+                'without it. Choose the language again to retry.</p></div>')
+    return summary_column(title, tr, tr["other_heading"], tr["placeholder"], tr["badge"])
+
+
 def summary_html(summary):
-    def column(lang, title, h_other):
-        s_ = summary[lang]
-        parts = []
-        for heading, text in s_["sections"]:
-            if text:
-                parts.append(f"<h4>{escape(heading)}</h4><p>{escape(text)}</p>")
-            else:
-                parts.append(f'<h4>{escape(heading)} <span class="ai-badge">Placeholder</span></h4>'
-                             f'<p class="ai-placeholder">{AI_PLACEHOLDER[lang]}</p>')
-        if s_["other"]:
-            parts.append(f"<h4>{h_other}</h4><p>{escape(s_['other'])}</p>")
-        note = f'<p class="sum-note">{escape(s_["note"])}</p>' if s_["note"] else ""  # skip an empty note
-        return f'<div class="sum-col"><div class="sum-lang">{title}</div>{"".join(parts)}{note}</div>'
-    return html('<div class="summary">'
-                + column("en", "English", "Other findings")
-                + column("ms", "Bahasa Melayu", "Penemuan lain")
-                + "</div>", sizing_mode="stretch_width")
+    lang = summary_lang.value
+    return ('<div class="summary">'
+            + summary_column("English", summary["en"], "Other findings", AI_PLACEHOLDER["en"])
+            + second_column(summary, lang)
+            + "</div>")
 
 
-def render_analysis():
+summary_pane = html("", sizing_mode="stretch_width")
+
+
+def refresh_summary(event=None):
+    an = ws.get("analysis")
+    if an and an.get("summary"):
+        summary_pane.object = summary_html(an["summary"])
+
+
+def on_summary_lang(event):
+    # choosing a language again after a failed try asks Gemma again
+    an = ws.get("analysis")
+    if an and an.get("summary") and event.new != "ms":
+        key = translation_key(event.new, an["summary"]["en"])
+        if "error" in (_translations.get(key) or {}):
+            del _translations[key]
+    refresh_summary()
+
+
+summary_lang.param.watch(on_summary_lang, "value")
+summary_bar = pn.FlexBox(
+    html('<span class="label">Summary</span>', align="center", margin=(0, 24, 0, 0)),
+    labelled("Second language", summary_lang, right=0),
+    flex_wrap="wrap", align_items="center", justify_content="space-between",
+    sizing_mode="stretch_width", gap="10px 0px", margin=(18, 0, 0, 0))
+
+
+def render_analysis(force=False):
     """(Re)draw the analysis card. The whole-volume part is kept from the last
-    run; the slice part is recomputed for whatever slice is on screen now."""
+    run; the slice part is recomputed for whatever slice is on screen now.
+    Only done while the Analysis page is open: otherwise it's marked out of date
+    and redrawn when the page is opened (it has two plots of its own, so
+    redrawing it on every slice change made the viewer slow)."""
     an = ws["analysis"]
     if not an:
         return
+    if ws.get("page") != "analysis" and not force:
+        ws["analysis_stale"] = True
+        return
+    ws["analysis_stale"] = False
     sl = current_slice_analysis()
     an["slice"] = sl
     base_label, mon_label = an["labels"]
@@ -2494,8 +2798,10 @@ def render_analysis():
     analysis_body.objects = [
         stats_html(an["volume"]),
         pn.Row(*plots, sizing_mode="stretch_width", margin=0, styles={"gap": "16px"}),
-        summary_html(an["summary"]),
+        summary_bar,
+        summary_pane,
     ]
+    refresh_summary()
 
 
 def reset_analysis(message=None):
@@ -2518,7 +2824,7 @@ def on_run(event=None):
         vol = analyse_volume(base["vol"], mon["vol"])
         ws["analysis"] = {"volume": vol, "labels": (base["title"], mon["title"]),
                           "files": (base["name"], mon["name"]), "credit": ws["credit"]}
-        render_analysis()
+        render_analysis(force=True)
         pdf_btn.filename = pdf_filename()
         pdf_btn.disabled = False
         step = vol["sample_step"]
@@ -2541,12 +2847,17 @@ def make_pdf():
     from matplotlib.backends.backend_pdf import PdfPages
     from matplotlib.figure import Figure
 
+    if ws.get("analysis_stale") or "summary" not in ws["analysis"]:
+        render_analysis(force=True)  # bring the slice part up to date first
     an = ws["analysis"]
     vol, sl, summary = an["volume"], an.get("slice"), an["summary"]
     base_label, mon_label = an["labels"]
     credit = an.get("credit", "").strip()
     a4 = (8.27, 11.69)
     ink, grey = "#13212a", "#5b6b73"
+    # Chinese characters come from Microsoft YaHei (matplotlib falls back to it
+    # for any character DejaVu Sans doesn't have)
+    matplotlib.rcParams["font.family"] = ["DejaVu Sans", "Microsoft YaHei", "SimHei"]
     stamp = datetime.now().strftime("%d %b %Y, %H:%M")
 
     def footer(fig, page):
@@ -2554,6 +2865,13 @@ def make_pdf():
             for k, line in enumerate(textwrap.wrap(credit, 120)):
                 fig.text(0.07, 0.035 - k * 0.012, line, fontsize=6.5, color=grey)
         fig.text(0.93, 0.035, f"Reservoir Time Machine · page {page}", fontsize=6.5, color=grey, ha="right")
+
+    def wrap(text, width):
+        # Chinese characters are about twice as wide as Latin letters (and have no
+        # spaces to break at), so wrap them at half the width
+        if any("　" <= ch <= "鿿" or "＀" <= ch <= "￯" for ch in text):
+            width //= 2
+        return textwrap.wrap(text, width)
 
     def text_page(fig, title, sections, note):
         fig.text(0.07, 0.94, title, fontsize=16, weight="bold", color=ink)
@@ -2563,12 +2881,12 @@ def make_pdf():
             fig.text(0.07, y, heading, fontsize=11.5, weight="bold", color=ink)
             y -= 0.03
             for para in paragraphs or ["–"]:
-                for line in textwrap.wrap(para, 92):
+                for line in wrap(para, 92):
                     fig.text(0.07, y, line, fontsize=10, color=ink)
                     y -= 0.019
                 y -= 0.012
             y -= 0.012
-        for line in textwrap.wrap(note, 100):
+        for line in wrap(note, 100):
             fig.text(0.07, y, line, fontsize=8.5, color=grey, style="italic")
             y -= 0.016
 
@@ -2609,20 +2927,41 @@ def make_pdf():
         footer(fig, 1)
         pdf.savefig(fig)
 
-        # pages 2 and 3: the summaries
-        for page, (lang, title, h_other) in enumerate(
-                [("en", "Summary (English)", "Other findings"),
-                 ("ms", "Ringkasan (Bahasa Melayu)", "Penemuan lain")], start=2):
+        # page 2: English summary; page 3: the second language chosen on the Analysis card
+        pages = [("Summary (English)", summary["en"], "Other findings", [AI_PLACEHOLDER["en"]] * 3)]
+        lang = summary_lang.value
+        missing = None  # why the second language isn't printed, if it isn't
+        if lang == "ms":
+            pages.append(("Ringkasan (Bahasa Melayu)", summary["ms"], "Penemuan lain", [AI_PLACEHOLDER["ms"]] * 3))
+        elif lang in PDF_UNPRINTABLE:
+            missing = PDF_UNPRINTABLE[lang]
+        else:
+            tr = translated_summary(lang, summary["en"])
+            if tr is None or "error" in tr:
+                missing = f"The {SUMMARY_LANGS[lang][2]} summary wasn't ready when this PDF was made."
+            else:
+                pages.append((f"{tr_title(lang)}", tr, tr["other_heading"], tr["placeholder"]))
+        for page, (title, s, h_other, placeholders) in enumerate(pages, start=2):
             fig = Figure(figsize=a4)
-            s = summary[lang]
-            sections = [(heading, [text or AI_PLACEHOLDER[lang]]) for heading, text in s["sections"]]
+            sections = [(heading, [text or placeholders[i]]) for i, (heading, text) in enumerate(s["sections"])]
             if s["other"]:
                 sections.append((h_other, [s["other"]]))
-            text_page(fig, title, sections, s["note"])
+            note = s["note"] + (f"  {missing}" if missing and page == 2 else "")
+            text_page(fig, title, sections, note)
             footer(fig, page)
             pdf.savefig(fig)
     buf.seek(0)
     return buf
+
+
+# Languages the PDF can't print: Tamil needs text shaping (vowel signs placed
+# before letters, joined letter pairs), which matplotlib doesn't do, so its
+# letters would come out in the wrong order. The app shows it correctly.
+PDF_UNPRINTABLE = {"ta": "The Tamil summary is shown in the app; the PDF can't print Tamil script yet."}
+
+
+def tr_title(lang):
+    return {"zh": "摘要（中文）", "ta": "சுருக்கம் (தமிழ்)"}.get(lang, "Summary")
 
 
 def pdf_filename():
@@ -2717,21 +3056,237 @@ layer_tabs = pn.widgets.RadioButtonGroup(options=["Shapes", "Horizons"], value="
 horizons_ui.card.visible = False
 layer_tabs.param.watch(lambda e: (setattr(shapes_card, "visible", e.new == "Shapes"),
                                   setattr(horizons_ui.card, "visible", e.new == "Horizons")), "value")
+show_row = labelled("Show on the seismic", show_select, right=0)  # hidden on time slices (no horizons there)
 layers_panel = pn.Column(
     pn.FlexBox(
         pn.Row(html('<span class="label">Layers</span>', align="center", margin=(0, 18, 0, 0)), layer_tabs,
                margin=0),
-        labelled("Show on the seismic", show_select, right=0),
+        show_row,
         flex_wrap="wrap", align_items="center", justify_content="space-between",
         sizing_mode="stretch_width", gap="10px 0px", margin=0),
     shapes_card,
     horizons_ui.card,
     sizing_mode="stretch_width", styles=CARD_STYLES, margin=(0, 0, 8, 0), visible=False,
 )
+# --- Gemma horizons (directly under Layers): Gemma suggests three horizons on the
+# section on screen, they're previewed on the seismic, and the user keeps one.
+# The suggestions come from ai.suggest_horizons() (a placeholder for now).
+gemma_btn = pn.widgets.Button(name="✦  Draw horizons with Gemma", width=250, align="center", margin=(0, 12, 0, 0),
+                              stylesheets=[BTN_BASE_CSS, PRIMARY_BTN_CSS])
+gemma_status = html("", align="center")  # sized to its text, so the title and button stay on one row
+gemma_use = pn.widgets.Button(name="Use this horizon", width=160, align="center", margin=(0, 10, 0, 0),
+                              stylesheets=[BTN_BASE_CSS, PRIMARY_BTN_CSS])
+gemma_discard = pn.widgets.Button(name="Discard", width=100, align="center", margin=0,
+                                  stylesheets=[BTN_BASE_CSS])
+
+
+def _option_card(k):
+    letter = "ABC"[k]
+    return (f'<div id="card{k}" class="gopt" onclick="${{script(\'pick{k}\')}}" role="button" tabindex="0">'
+            f'<span id="tag{k}" class="gopt-tag">Selected</span>'
+            f'<div class="gopt-letter"><span class="gopt-swatch" style="background:{GEMMA_OPTION_COLOURS[k]}">'
+            f'</span>Option {letter}</div>'
+            # filled as plain text by the "fill" script (a ${param} here would become a
+            # separate Markdown pane in Panel's own font and colours)
+            f'<div id="n{k}" class="gopt-name"></div>'
+            f'<div id="d{k}" class="gopt-desc"></div></div>')
+
+
+class OptionCards(pn.reactive.ReactiveHTML):
+    """Gemma's three suggested horizons as cards: click one to select it (`selected`)."""
+    selected = param.Integer(default=0)
+    count = param.Integer(default=0)
+    name0, name1, name2 = param.String(default=""), param.String(default=""), param.String(default="")
+    desc0, desc1, desc2 = param.String(default=""), param.String(default=""), param.String(default="")
+
+    _template = '<div id="wrap" class="gopts">' + "".join(_option_card(k) for k in range(3)) + "</div>"
+    _scripts = {
+        "render": "self.fill(); self.mark();",
+        "selected": "self.mark();",
+        "count": "self.mark();",
+        "fill": "n0.textContent = data.name0; n1.textContent = data.name1; n2.textContent = data.name2;"
+                " d0.textContent = data.desc0; d1.textContent = data.desc1; d2.textContent = data.desc2;",
+        **{f"{p}{k}": "self.fill();" for p in ("name", "desc") for k in range(3)},
+        "pick0": "data.selected = 0;",
+        "pick1": "data.selected = 1;",
+        "pick2": "data.selected = 2;",
+        "mark": "[card0, card1, card2].forEach((c, k) => { c.classList.toggle('sel', k === data.selected);"
+                " c.style.display = k < data.count ? '' : 'none'; });",
+    }
+
+
+gemma_cards = OptionCards(stylesheets=[BASE_CSS], sizing_mode="stretch_width", margin=(16, 0, 0, 0))
+gemma_result = pn.Column(
+    gemma_cards,
+    pn.Row(pn.layout.HSpacer(), gemma_use, gemma_discard, sizing_mode="stretch_width", margin=(14, 0, 0, 0)),
+    sizing_mode="stretch_width", margin=0, visible=False)
+gemma_btn.margin = 0
+gemma_status.margin = (0, 16, 0, 16)
+gemma_card = pn.Column(
+    # one row: logo + title on the left, any message, the button on the right
+    # (wraps the button onto its own line on narrow windows)
+    pn.FlexBox(
+        # size set on the image itself (same as the old ✦ tile), so it can never show at full size
+        html(f'<div class="gemma-head"><img class="gemma-logo" src="{GEMMA_LOGO_SRC}" alt="Gemma" width="24" '
+             'height="24" style="width:24px;height:24px;border-radius:7px;display:block;flex-shrink:0">'
+             '<span class="label">Gemma horizons</span></div>', align="center", margin=0),
+        pn.Row(gemma_status, gemma_btn, margin=0, align="center"),
+        flex_wrap="wrap", align_items="center", justify_content="space-between",
+        sizing_mode="stretch_width", gap="12px 0px", margin=0),
+    gemma_result,
+    sizing_mode="stretch_width", styles=CARD_STYLES, margin=(0, 0, 8, 0), visible=False,
+)
+
+
+def gemma_say(msg, kind=""):
+    gemma_status.object = f'<span class="status {kind}">{msg}</span>' if msg else ""
+
+
+def gemma_fill_cards():
+    opts = ws.get("gemma_options") or []
+    values = {"count": len(opts[:3]), "selected": 0}
+    for k in range(3):
+        opt = opts[k] if k < len(opts) else {}
+        values[f"name{k}"] = str(opt.get("name", ""))
+        values[f"desc{k}"] = str(opt.get("description", ""))
+    gemma_cards.param.update(**values)
+
+
+def gemma_preview():
+    """Draw the suggested options on the plots: the chosen one bold, the others faint."""
+    src = ws.get("gemma_src")
+    if src is None:
+        return
+    opts, data = ws.get("gemma_options") or [], {"xs": [], "ys": [], "colour": [], "alpha": [], "width": []}
+    for k, opt in enumerate(opts[:3]):
+        sel = k == gemma_cards.selected
+        data["xs"].append(list(opt["along"])), data["ys"].append(list(opt["twt"]))
+        data["colour"].append(GEMMA_OPTION_COLOURS[k])
+        data["alpha"].append(1.0 if sel else 0.45), data["width"].append(3.5 if sel else 1.8)
+    src.data = data
+
+
+def gemma_attach(p):
+    """The preview layer on one plot (called from build_views)."""
+    p.multi_line("xs", "ys", source=ws["gemma_src"], line_color="colour", line_alpha="alpha",
+                 line_width="width", line_dash="dashed")
+
+
+def gemma_clear(event=None, message="", kind=""):
+    ws["gemma_options"] = None
+    gemma_result.visible = False
+    gemma_preview()
+    gemma_say(message, kind)
+
+
+def gemma_section_changed():
+    """The slice or view changed: suggestions were for another section, so drop them."""
+    if ws.get("gemma_options"):
+        gemma_clear(message="Suggestions cleared: they were for another section.")
+    gemma_refresh_button()
+
+
+def gemma_refresh_button():
+    on_section = view_select.value != "Time slice"
+    gemma_btn.disabled = not on_section  # (the whole card is hidden on time slices anyway)
+
+
+def on_gemma(event=None):
+    """The button: ask in the background (Gemma can take a while), then show the
+    options. The plots may only be changed from the page's own update loop, so
+    the answer is applied through add_next_tick_callback (as Run does)."""
+    view, pos = view_select.value, position_input.value
+    t = ws.get("t_range") or (0, 2000)
+    vals = slider_values(ws["surveys"], "Crossline" if view == "Inline" else "Inline")
+    base = next((s_ for s_ in ws["surveys"] if s_["vol"] is not None), {"title": ""})
+    context = {"view": view, "position": pos, "along": (float(vals[0]), float(vals[-1])),
+               "twt_range": (float(t[0]), float(t[1])), "baseline_label": base["title"]}
+    gemma_clear()
+    gemma_btn.disabled = True
+    set_label(gemma_btn, "✦  Gemma is drawing…")
+    doc = pn.state.curdoc
+
+    async def work():
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(None, suggest_horizons, context)
+        except Exception as exc:
+            result = exc
+        doc.add_next_tick_callback(lambda: gemma_show(result, view, pos))
+
+    if doc is not None and doc.session_context is not None:
+        asyncio.get_event_loop().create_task(work())
+    else:  # no browser session (e.g. a test script)
+        try:
+            gemma_show(suggest_horizons(context), view, pos)
+        except Exception as exc:
+            gemma_show(exc, view, pos)
+
+
+def gemma_show(options, view, pos):
+    """Gemma's answer arrived: show its options (or say what went wrong)."""
+    try:
+        if isinstance(options, Exception):
+            raise options
+        if (view_select.value, position_input.value) != (view, pos):
+            return gemma_say("The slice changed while Gemma was working; press the button again.")
+        if not options:
+            return gemma_say("Gemma didn't suggest any horizons here.", "err")
+        ws["gemma_options"], ws["gemma_section"] = list(options)[:3], (view, pos)
+        gemma_fill_cards()
+        gemma_result.visible = True
+        gemma_preview()
+    except Exception as exc:
+        gemma_say(f"Couldn't get suggestions from Gemma: {escape(str(exc))}", "err")
+    finally:
+        set_label(gemma_btn, "✦  Draw horizons with Gemma")
+        gemma_refresh_button()
+
+
+def on_gemma_use(event=None):
+    opts = ws.get("gemma_options")
+    if not opts:
+        return
+    k = min(gemma_cards.selected, len(opts) - 1)
+    opt, (view, pos) = opts[k], ws["gemma_section"]
+    along = np.asarray(opt["along"], float)
+    fixed = np.full(len(along), float(pos))
+    il, xl = (fixed, along) if view == "Inline" else (along, fixed)
+    name = re.sub(r"^\[PH\]\s*", "", opt["name"]).strip() or "Gemma horizon"
+    name = f"Gemma {name}" if not name.lower().startswith("gemma") else name
+    horizons_ui.horizons.append(horizons.make_horizon(name, GEMMA_OPTION_COLOURS[k], il, xl,
+                                                      np.asarray(opt["twt"], float)))
+    horizons_ui.refresh_card()
+    horizons_ui.refresh()
+    gemma_clear(message=f"Added {escape(name)} to Horizons", kind="ok")
+
+
+gemma_btn.on_click(on_gemma)
+gemma_cards.param.watch(lambda e: gemma_preview(), "selected")  # a card was clicked
+gemma_use.on_click(on_gemma_use)
+gemma_discard.on_click(gemma_clear)
 layers_btn.param.watch(lambda e: setattr(layers_panel, "visible", e.new), "value")
+# shown only while Layers is open on its Horizons tab, on an inline / crossline
+def update_gemma_card(event=None):
+    gemma_card.visible = (layers_btn.value and layer_tabs.value == "Horizons"
+                          and view_select.value != "Time slice")
+
+
+def apply_view_layers():
+    """Time slices have no horizons: hide the Horizons tab (Layers shows Shapes only),
+    the Show toggle and the Gemma card there; an inline / crossline brings them back."""
+    on_map = view_select.value == "Time slice"
+    layer_tabs.visible = show_row.visible = not on_map
+    shapes_card.visible = on_map or layer_tabs.value == "Shapes"
+    horizons_ui.card.visible = not on_map and layer_tabs.value == "Horizons"
+    update_gemma_card()
+
+
+layers_btn.param.watch(update_gemma_card, "value")
+layer_tabs.param.watch(update_gemma_card, "value")
 display_btn.param.watch(lambda e: setattr(display_panel, "visible", e.new), "value")
 
-viewer_body = pn.Column(slice_bar, layers_panel, display_panel, content, sizing_mode="stretch_width", margin=0)
+viewer_body = pn.Column(slice_bar, layers_panel, gemma_card, display_panel, content,
+                        sizing_mode="stretch_width", margin=0)
 viewer_page = pn.Column(
     empty_state("No surveys loaded", "Choose the baseline and monitor SEG-Y files under Data sources and "
                 "press Run. The two surveys and the morph between them appear here.", ICON_VIEWER),
@@ -2855,6 +3410,7 @@ class _Live:
 import wells  # noqa: E402
 
 wells_ui = wells.WellsPage(_Live(globals()))
+wells_ui.well_select.param.watch(lambda event: refresh_overlay(), "value")  # hexagons follow the chosen well
 
 
 def show_page(page):
@@ -2864,6 +3420,8 @@ def show_page(page):
     refresh_data_pill()
     if page == "overview":
         refresh_overview()
+    if page == "analysis" and ws.get("analysis_stale"):
+        render_analysis()  # the slice changed while the page was closed
     # each data page: its empty state until surveys are loaded, then its content
     for pg, empty, body in ((overview_page, overview_page[0], overview_body),
                             (viewer_page, viewer_page[0], viewer_body),

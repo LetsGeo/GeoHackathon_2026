@@ -369,6 +369,7 @@ class WellsPage:
         self.update_overlay()
         self.refresh_table()
         self.refresh_controls()
+        self.app.refresh_overlay()  # the hexagon grid on the viewer's time slices sits on a well
 
     def refresh_controls(self):
         has, chosen = bool(self.wells), self.well_select.value is not None

@@ -70,6 +70,66 @@ def parse_json_reply(text):
     return json.loads(match.group(0))
 
 
+def translate_texts(texts, language):
+    """Translate a dict of English report texts into `language` (e.g. "Simplified
+    Chinese", "Tamil") with Gemma. Returns a dict with the same keys; a value that
+    is a list comes back as a list of the same length. Raises if Gemma can't be
+    reached or its reply doesn't fit."""
+    system = (
+        f"You translate short 4D seismic report texts from English into {language}. "
+        "Keep every number, unit (ms, %), inline / crossline number, survey name and the "
+        "abbreviation NRMS exactly as written. Use the usual technical term in "
+        f"{language} where one exists; otherwise keep the English term (e.g. push-down) in brackets. "
+        "Reply with a JSON object only: the same keys, each value translated, lists kept as lists "
+        "of the same length."
+    )
+    reply = gemma_chat(system, json.dumps(texts, ensure_ascii=False), max_tokens=2000)
+    out = parse_json_reply(reply)
+    for key, value in texts.items():
+        got = out.get(key)
+        if isinstance(value, list):
+            if not isinstance(got, list) or len(got) != len(value):
+                raise ValueError(f"the reply didn't translate '{key}' properly")
+            out[key] = [str(g) for g in got]
+        elif value and not got:
+            raise ValueError(f"the reply was missing '{key}'")
+        else:
+            out[key] = str(got or "")
+    return out
+
+
+def suggest_horizons(context):
+    """Horizons Gemma suggests for one inline / crossline section: the "Draw
+    horizons with Gemma" button in the Layers area calls this, and the app lets
+    the user pick one of the options it returns.
+
+    PLACEHOLDER: returns 3 made-up options marked [PH] so the UI can be tried.
+    Replace the body with the real Gemma call; nothing else in the app needs to change.
+
+    context:
+        view            "Inline" or "Crossline"
+        position        the inline / crossline number on screen
+        along           (first, last) crossline (on an inline) or inline (on a crossline)
+        twt_range       (top, bottom) two-way time shown, in ms
+        baseline_label  e.g. "1994 survey"
+    Return a list of options (3 are shown), each:
+        {"name": str, "description": str,
+         "along": [line numbers along the section], "twt": [two-way time in ms, same length]}
+    """
+    import numpy as np
+    a0, a1 = context["along"]
+    t0, t1 = context["twt_range"]
+    along = np.linspace(a0, a1, 40)
+    s = (along - a0) / max(a1 - a0, 1)
+    options = []
+    for k, (frac, name) in enumerate([(0.42, "Option A"), (0.5, "Option B"), (0.58, "Option C")]):
+        twt = t0 + (t1 - t0) * frac + 18 * np.sin(s * np.pi * (1.5 + k * 0.5)) - 25 * np.exp(-((s - 0.45) / 0.15) ** 2)
+        options.append({"name": f"{PLACEHOLDER_TAG} {name}",
+                        "description": f"{PLACEHOLDER_TAG} Gemma's reason for this pick will appear here.",
+                        "along": along.round(1).tolist(), "twt": twt.round(1).tolist()})
+    return options
+
+
 def _fmt(value, digits=3):
     return "unknown" if value is None else f"{value:.{digits}g}"
 

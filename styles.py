@@ -323,6 +323,26 @@ table.overview td.right {{ text-align: right; }}
 .sum-col p.ai-placeholder {{ color: {MUTED}; font-style: italic; }}
 .ai-badge {{ font-size: 10.5px; font-weight: 500; padding: 1px 8px; border-radius: 999px;
              border: 1px solid {BORDER_STRONG}; color: {MUTED}; margin-left: 6px; vertical-align: 1px; }}
+/* Gemma horizons: the three suggested options */
+.gopts {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px;
+           font-family: {SANS}; }}  /* (set here: Bokeh's default font would win inside the component) */
+.gopt {{ position: relative; background: {CARD_2}; border: 1px solid {BORDER}; border-radius: 14px;
+         padding: 12px 14px 13px 16px; cursor: pointer; user-select: none;
+         transition: border-color .15s ease, background-color .15s ease; }}
+.gopt:hover {{ border-color: {BORDER_STRONG}; background: var(--hover); }}
+.gopt:focus-visible {{ outline: 2px solid {ACCENT}; outline-offset: 2px; }}
+.gopt.sel, .gopt.sel:hover {{ border-color: {ACCENT}; background: var(--accent-soft); }}
+.gopt-letter {{ display: flex; align-items: center; gap: 8px; font-size: 11px; font-weight: 700; color: {MUTED};
+                letter-spacing: .08em; text-transform: uppercase; padding-right: 72px; }}
+.gopt-name {{ font-size: 14px; font-weight: 700; color: {TEXT}; margin-top: 7px; }}
+.gopt-swatch {{ width: 18px; height: 4px; border-radius: 2px; flex-shrink: 0; }}
+.gopt-desc {{ font-size: 12.5px; color: {TEXT_2}; line-height: 1.5; margin-top: 4px; }}
+.gopt-tag {{ display: none; position: absolute; top: 11px; right: 13px; font-size: 10.5px; font-weight: 700;
+             color: {ACCENT}; letter-spacing: .06em; text-transform: uppercase; }}
+.gopt.sel .gopt-tag {{ display: block; }}
+/* the Gemma horizons heading: logo and title centred on one line */
+.gemma-head {{ display: flex; align-items: center; gap: 10px; }}
+.gemma-logo {{ display: block; width: 24px; height: 24px; border-radius: 7px; flex-shrink: 0; }}
 .morph-ends {{ display: flex; justify-content: space-between;
                font-size: 11px; color: {TEXT_2}; }}
 """
@@ -618,6 +638,8 @@ ICON_HORIZON = svg_icon("M3 15c3-5 5-5 8-1s5 4 10-3M3 20h18")
 # Horizons: loaded ones take these colours in turn; ones drawn in the app share one
 HORIZON_COLOURS = ["#f59e0b", "#a855f7", "#22c55e", "#ec4899", "#06b6d4", "#84cc16"]
 DRAWN_HORIZON_COLOUR = "#facc15"
+# Gemma's three suggested horizons, previewed on the seismic before one is chosen
+GEMMA_OPTION_COLOURS = ["#38bdf8", "#f472b6", "#a3e635"]
 
 # ---------------------------------------------------------------------------
 # Full-screen loading overlay shown while Run is working (loading.py)
@@ -662,9 +684,15 @@ LOADING_CSS = f"""
 ICON_FS_EXIT = svg_icon("M9 4v5H4M20 9h-5V4M15 20v-5h5M4 15h5v5")
 
 
-# Easter egg: clicking the theme button 10 times within 3 seconds splatters oil
-# over the screen for 5 seconds. Runs entirely in the browser; the overlay
-# ignores the mouse, so the app stays usable underneath.
+# Easter egg: clicking the theme switch 10 times within 3 seconds splatters oil
+# over the screen. Each splat lands, its drips run down, then the whole lot slides
+# off the bottom of the screen. Runs entirely in the browser; the overlay ignores
+# the mouse, so the app stays usable underneath.
+#
+# How it looks liquid: every splat is built from overlapping circles (body, splash
+# arms as chains of shrinking circles, drips as rounded bars with a bulb), and an
+# SVG "goo" filter blurs them together and sharpens the edge again, so they melt
+# into one fluid shape. The same filter adds a specular highlight for the oily gloss.
 OIL_SPLATTER_JS = r"""
 const now = Date.now();
 const clicks = (window.__oilClicks || []).filter(t => now - t < 3000);
@@ -684,96 +712,102 @@ if (clicks.length >= 10 && !window.__oilActive) {
     if (parent) parent.appendChild(e);
     return e;
   };
-  const animate = (e, frames, opts) => { if (!still && e.animate) e.animate(frames, opts); };
-
-  // irregular closed blob: random radii round a circle, smoothed through midpoints
-  const blob = (cx, cy, r, n) => {
-    const pts = [];
-    for (let i = 0; i < n; i++) {
-      const a = (i / n) * Math.PI * 2 + rand(-0.15, 0.15);
-      const rr = r * rand(0.7, 1.15) * (Math.random() < 0.3 ? rand(1.2, 1.6) : 1);
-      pts.push([cx + Math.cos(a) * rr, cy + Math.sin(a) * rr]);
-    }
-    const mid = (p, q) => [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2];
-    const s = mid(pts[n - 1], pts[0]);
-    let d = 'M' + s[0].toFixed(1) + ',' + s[1].toFixed(1);
-    for (let i = 0; i < n; i++) {
-      const m = mid(pts[i], pts[(i + 1) % n]);
-      d += ' Q' + pts[i][0].toFixed(1) + ',' + pts[i][1].toFixed(1) + ' ' + m[0].toFixed(1) + ',' + m[1].toFixed(1);
-    }
-    return d + 'Z';
-  };
+  const play = (e, frames, opts) => { if (!still && e.animate) e.animate(frames, opts); };
+  const OIL = '#0b0603';
+  const blur = Math.max(3, 5.5 * unit);          // the goo radius: bigger = rounder, more merged
+  const minDot = blur * 1.5;                      // anything smaller would vanish in the filter
 
   const svg = el('svg', {width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, 'aria-hidden': 'true'});
-  svg.style.cssText = 'position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;' +
-                      'transition:opacity 1s ease;filter:drop-shadow(0 4px 6px rgba(0,0,0,.35));';
+  svg.style.cssText = 'position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;overflow:visible;';
   const defs = el('defs', {}, svg);
-  const fill = el('radialGradient', {id: 'oil-fill', cx: '38%', cy: '32%', r: '80%'}, defs);
-  [['0%', '#2b1e0d'], ['35%', '#110b05'], ['100%', '#020101']].forEach(
-    ([o, c]) => el('stop', {offset: o, 'stop-color': c}, fill));
-  const sheen = el('linearGradient', {id: 'oil-sheen', x1: '0', y1: '0', x2: '1', y2: '1'}, defs);
-  [['0%', '#6fd3ff', '.10'], ['30%', '#000', '0'], ['55%', '#c77dff', '.08'], ['80%', '#000', '0'],
-   ['100%', '#ffd166', '.10']].forEach(
-    ([o, c, a]) => el('stop', {offset: o, 'stop-color': c, 'stop-opacity': a}, sheen));
+  const f = el('filter', {id: 'rtm-oil', x: '-30%', y: '-30%', width: '160%', height: '160%',
+                          'color-interpolation-filters': 'sRGB'}, defs);
+  el('feGaussianBlur', {in: 'SourceGraphic', stdDeviation: blur, result: 'blur'}, f);
+  el('feColorMatrix', {in: 'blur', mode: 'matrix', result: 'goo',
+                       values: '1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 26 -11'}, f);
+  el('feGaussianBlur', {in: 'goo', stdDeviation: blur * 0.6, result: 'bump'}, f);
+  // shine only where the surface curves towards the light (a high exponent keeps flat areas dark)
+  const spec = el('feSpecularLighting', {in: 'bump', surfaceScale: 5, specularConstant: 1.3,
+                                         specularExponent: 70, 'lighting-color': '#ffffff', result: 'spec'}, f);
+  el('feDistantLight', {azimuth: 225, elevation: 38}, spec);
+  el('feComposite', {in: 'spec', in2: 'goo', operator: 'in', result: 'shine'}, f);
+  el('feComposite', {in: 'shine', in2: 'goo', operator: 'arithmetic', k1: 0, k2: 0.75, k3: 1, k4: 0}, f);
 
-  const count = Math.round(rand(6, 9));
+  const EXIT = 3200;                              // when the splats start sliding off
+  let lastEnd = 0;
+  const count = Math.round(rand(5, 8));
   for (let k = 0; k < count; k++) {
-    const cx = rand(0.08, 0.92) * W, cy = rand(0.08, 0.85) * H;
-    const r = rand(45, 130) * unit;
-    const delay = k * 110;
-    const g = el('g', {}, svg);
+    const cx = rand(0.08, 0.92) * W, cy = rand(0.06, 0.62) * H;
+    const r = rand(42, 95) * unit;
+    const delay = k * 130 + rand(0, 80);
+    const fall = el('g', {filter: 'url(#rtm-oil)'}, svg);     // slides the whole splat off at the end
+    const dripLayer = el('g', {}, fall);
+    const splat = el('g', {}, fall);
+    const dot = (x, y, rr, parent) => el('circle', {cx: x, cy: y, r: Math.max(rr, minDot), fill: OIL}, parent);
 
-    // drips run down from the lower half of the splat
-    const drips = Math.round(rand(1, 3.4));
-    for (let i = 0; i < drips; i++) {
-      const w = r * rand(0.1, 0.2), len = r * rand(1.4, 3.4);
-      const x = cx + rand(-0.55, 0.55) * r;
-      const drip = el('g', {}, g);
-      el('rect', {x: x - w / 2, y: cy, width: w, height: len, rx: w / 2, fill: 'url(#oil-fill)'}, drip);
-      el('circle', {cx: x, cy: cy + len, r: w * 0.75, fill: 'url(#oil-fill)'}, drip);
-      drip.style.transformBox = 'fill-box';
-      drip.style.transformOrigin = 'top';
-      animate(drip, [{transform: 'scaleY(0)'}, {transform: 'scaleY(1)'}],
-              {duration: rand(1600, 3000), delay: delay + 150, easing: 'cubic-bezier(.4,0,.8,.7)', fill: 'both'});
+    // body: a big drop with overlapping lobes, so the outline is organic, not a circle
+    dot(cx, cy, r, splat);
+    const lobes = Math.round(rand(8, 12));
+    for (let i = 0; i < lobes; i++) {
+      const a = (i / lobes) * Math.PI * 2 + rand(-0.25, 0.25), d = r * rand(0.5, 0.95);
+      dot(cx + Math.cos(a) * d, cy + Math.sin(a) * d, r * rand(0.3, 0.55), splat);
     }
-
-    // the splat itself, with a rainbow oil sheen and a glossy highlight
-    const splat = el('g', {}, g);
-    const d = blob(cx, cy, r, Math.round(rand(14, 20)));
-    // splash arms: tapered streaks thrown out from the impact, each ending in a droplet
-    const arms = Math.round(rand(6, 11));
+    // a few short, thick splash arms (chains of shrinking drops that merge into rounded streaks)
+    const arms = Math.round(rand(2, 4));
     for (let i = 0; i < arms; i++) {
-      const a = rand(0, Math.PI * 2), L = r * rand(1.15, 2.1), bw = r * rand(0.14, 0.3);
-      const ux = Math.cos(a), uy = Math.sin(a), px = -uy, py = ux;
-      const at = (along, side) => (cx + ux * along + px * side).toFixed(1) + ',' + (cy + uy * along + py * side).toFixed(1);
-      el('path', {d: 'M' + at(r * 0.5, bw / 2) + ' Q' + at(L * 0.72, bw * 0.12) + ' ' + at(L, 0) +
-                     ' Q' + at(L * 0.72, -bw * 0.12) + ' ' + at(r * 0.5, -bw / 2) + 'Z', fill: 'url(#oil-fill)'}, splat);
-      el('circle', {cx: cx + ux * (L + bw * 0.15), cy: cy + uy * (L + bw * 0.15), r: bw * rand(0.3, 0.45),
-                    fill: 'url(#oil-fill)'}, splat);
+      const a = rand(0, Math.PI * 2), len = rand(1.25, 1.75), steps = 4;
+      for (let s = 0; s < steps; s++) {
+        const along = r * (0.9 + (len - 0.9) * s / (steps - 1));
+        dot(cx + Math.cos(a) * along, cy + Math.sin(a) * along, r * 0.3 * (1 - s * 0.17), splat);
+      }
+      dot(cx + Math.cos(a) * r * (len + 0.4), cy + Math.sin(a) * r * (len + 0.4), r * 0.15, splat);  // tip droplet
     }
-    el('path', {d: d, fill: 'url(#oil-fill)'}, splat);
-    el('path', {d: d, fill: 'url(#oil-sheen)'}, splat);
-    el('ellipse', {cx: cx - r * 0.3, cy: cy - r * 0.32, rx: r * 0.28, ry: r * 0.1, fill: '#fff', opacity: '.22',
-                   transform: 'rotate(-28 ' + (cx - r * 0.3) + ' ' + (cy - r * 0.32) + ')'}, splat);
-    el('ellipse', {cx: cx - r * 0.05, cy: cy - r * 0.48, rx: r * 0.07, ry: r * 0.035, fill: '#fff', opacity: '.35'}, splat);
-
-    // flung droplets around it
-    const drops = Math.round(rand(6, 13));
+    // loose droplets flung further out
+    const drops = Math.round(rand(4, 8));
     for (let i = 0; i < drops; i++) {
-      const a = rand(0, Math.PI * 2), dist = r * rand(1.1, 2.6);
-      el('circle', {cx: cx + Math.cos(a) * dist, cy: cy + Math.sin(a) * dist,
-                    r: r * rand(0.025, 0.09), fill: 'url(#oil-fill)'}, splat);
+      const a = rand(0, Math.PI * 2), d = r * rand(1.7, 2.6);
+      dot(cx + Math.cos(a) * d, cy + Math.sin(a) * d, r * rand(0.08, 0.16), splat);
     }
     splat.style.transformBox = 'fill-box';
     splat.style.transformOrigin = 'center';
-    animate(splat, [{transform: 'scale(.15)', opacity: 0}, {transform: 'scale(1.08)', opacity: 1, offset: 0.6},
-                    {transform: 'scale(1)', opacity: 1}],
-            {duration: 380, delay: delay, easing: 'cubic-bezier(.2,.8,.3,1)', fill: 'both'});
+    play(splat, [{transform: 'scale(.15)', opacity: 0}, {transform: 'scale(1.1)', opacity: 1, offset: 0.55},
+                 {transform: 'scale(.97)', offset: 0.8}, {transform: 'scale(1)', opacity: 1}],
+         {duration: 520, delay: delay, easing: 'cubic-bezier(.2,.8,.3,1)', fill: 'both'});
+
+    // drips: rounded bars with a heavier bulb at the end, running down under gravity
+    const drips = Math.round(rand(2, 4));
+    let longest = 0;
+    for (let i = 0; i < drips; i++) {
+      const w = r * rand(0.16, 0.27), len = r * rand(1.4, 3.6);
+      const x = cx + rand(-0.6, 0.6) * r;
+      longest = Math.max(longest, len);
+      const drip = el('g', {}, dripLayer);
+      el('rect', {x: x - w / 2, y: cy - r * 0.2, width: w, height: len + r * 0.2, rx: w / 2, fill: OIL}, drip);
+      dot(x, cy + len, w * 0.8, drip);
+      drip.style.transformBox = 'fill-box';
+      drip.style.transformOrigin = 'top';
+      const grow = rand(1700, 2800);
+      play(drip, [{transform: 'scaleY(0)'}, {transform: 'scaleY(.35)', offset: 0.3}, {transform: 'scaleY(1)'}],
+           {duration: grow, delay: delay + 280, easing: 'cubic-bezier(.45,0,.75,1)', fill: 'both'});
+      // and they stretch further as the splat slides off
+      const leave = EXIT + k * 140;
+      play(drip, [{transform: 'scaleY(1)'}, {transform: 'scaleY(' + rand(1.6, 2.3).toFixed(2) + ')'}],
+           {duration: 1500, delay: leave, easing: 'ease-in', fill: 'forwards'});
+    }
+
+    // slide off the bottom of the screen, speeding up like a falling drop
+    const start = EXIT + k * 140 + rand(0, 260), dur = rand(1500, 2100);
+    const drop = H - cy + r * 3.5 + longest * 2.4;
+    play(fall, [{transform: 'translateY(0)'}, {transform: 'translateY(' + (drop * 0.08).toFixed(0) + 'px)', offset: 0.3},
+                {transform: 'translateY(' + drop.toFixed(0) + 'px)'}],
+         {duration: dur, delay: start, easing: 'cubic-bezier(.55,0,.85,.4)', fill: 'forwards'});
+    play(splat, [{transform: 'scale(1, 1)'}, {transform: 'scale(.92, 1.25)'}],
+         {duration: dur, delay: start, easing: 'ease-in', fill: 'forwards'});
+    lastEnd = Math.max(lastEnd, start + dur);
   }
 
   document.body.appendChild(svg);
-  setTimeout(() => { svg.style.opacity = '0'; }, 4000);  // fade over the last second
-  setTimeout(() => { svg.remove(); window.__oilActive = false; }, 5000);
+  setTimeout(() => { svg.remove(); window.__oilActive = false; }, still ? 4000 : lastEnd + 150);
 }
 """
 
