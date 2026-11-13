@@ -242,7 +242,7 @@ def hexagon(center_iline: int, center_xline: int):
 HEXAGONS = {
     1: (1006, 2412),
 }
-N_LINES = 5  # inlines and crosslines per hexagon, spread evenly across it
+N_LINES = 10  # inlines and crosslines per hexagon, spread evenly across it
 
 import matplotlib
 from matplotlib.colors import LinearSegmentedColormap, Normalize
