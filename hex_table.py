@@ -92,8 +92,17 @@ def trace_attributes(base_vol, mon_vol, k0, k1, max_lag, block=32):
         raw = np.asarray(base_vol.data[a:bx, :, k0:k1], dtype=np.float32)
         M = np.asarray(mon_vol.data[a:b, :, k0:k1], dtype=np.float32)
         rows = b - a
-        live = np.any(raw[:rows] != 0, axis=-1)
-        drms[a:b] = np.where(live, rms(raw[:rows], axis=-1) - rms(M, axis=-1), np.nan)
+        # compare only samples that are finite in both surveys (some exports have NaN / inf
+        # samples inside live traces); a trace needs half its window usable
+        ok = np.isfinite(raw[:rows]) & np.isfinite(M)
+        n_ok = ok.sum(-1)
+        bz, mz = np.where(ok, raw[:rows], 0), np.where(ok, M, 0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rb = np.sqrt(np.sum(np.square(bz, dtype=np.float64), -1) / n_ok)
+            rm = np.sqrt(np.sum(np.square(mz, dtype=np.float64), -1) / n_ok)
+        live = (n_ok >= 0.5 * ok.shape[-1]) & np.any(bz != 0, axis=-1)
+        drms[a:b] = np.where(live, rb - rm, np.nan)
+        raw = np.where(np.isfinite(raw), raw, 0)  # the fault attribute uses the baseline only
         B = raw - raw.mean(-1, keepdims=True)
         c_x = np.full((rows, n_xl), np.nan, np.float32)
         c_x[:, :-1] = _best_corr(B[:rows, :-1], B[:rows, 1:], max_lag)

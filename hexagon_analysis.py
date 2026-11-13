@@ -174,7 +174,9 @@ def hexagon_pictures(name, corners, base, mon, k0, k1, n, amp, dif):
             else:
                 b, m = base.data[lo:hi, i, k0:k1], mon.data[lo:hi, i, k0:k1]
             b = np.asarray(b, np.float32)
-            d = np.asarray(m, np.float32) - b
+            m = np.asarray(m, np.float32)
+            d = np.where(np.isfinite(b) & np.isfinite(m), m - b, np.nan)  # blank where either isn't finite
+            b = np.where(np.isfinite(b), b, np.nan)
             what = "Inline" if axis == 0 else "Crossline"
             xlab = "Crossline" if axis == 0 else "Inline"
             x0, x1 = float(other[lo]), float(other[hi - 1])
@@ -448,8 +450,16 @@ def run(base_vol, mon_vol, well, horizons=(), geo=None, settings=None, progress=
                         np.float32)
     msample = np.asarray(mon.data[::max(1, len(base.ilines) // 60), ::max(1, len(base.xlines) // 60), k0:k1],
                          np.float32)
-    amp = float(np.percentile(np.abs(sample), 99)) or 1.0
-    dif = float(np.percentile(np.abs(msample - sample), 99)) or amp
+    def p99(a):
+        a = np.abs(a[np.isfinite(a)])
+        v = float(np.percentile(a, 99)) if a.size else 0.0
+        return v if v > 0 else None
+    amp = p99(sample) or 1.0
+    dif = p99(msample - sample) or amp  # NaN / inf samples (in either survey) are left out
+    bad = 1 - float(np.mean(np.isfinite(msample))) if msample.size else 0.0
+    if bad > 0.001:
+        notes.append(f"the monitor has {100 * bad:.1f}% non-finite samples (NaN / inf) in the window: "
+                     "those samples are left out of the comparison")
     pk0 = int(np.searchsorted(twt, max(twt[0], t0 - cfg["picture_pad_ms"]), "left"))
     pk1 = int(np.searchsorted(twt, min(twt[-1], t1 + cfg["picture_pad_ms"]), "right"))
     pictures = {}

@@ -2293,9 +2293,15 @@ def analyse_volume(bv, mv):
     il_s, xl_s = il[::step], xl[::step]
     B = read_block(bv, il_s, xl_s, times)
     M = read_block(mv, il_s, xl_s, times)
-    valid = np.isfinite(B).all(-1) & np.isfinite(M).all(-1)  # traces present in both surveys
+    # traces present in both surveys: at least 90% of their samples finite in both (some exports
+    # have NaN / inf samples inside live traces, e.g. muted zones); samples that aren't finite in
+    # both are zeroed in both, so they add no false difference
+    ok = np.isfinite(B) & np.isfinite(M)
+    valid = ok.mean(-1) >= 0.9
     if valid.sum() < 10:
         raise ValueError("too few traces exist in both surveys")
+    B = np.where(ok, B, 0).astype(np.float32)
+    M = np.where(ok, M, 0).astype(np.float32)
     B[~valid] = 0
     M[~valid] = 0
     D = M - B
