@@ -1,219 +1,14 @@
 import sys
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, Union
 
 import numpy as np
 
+# The 3D SEG-Y loader / aligner lives in volume3d.py (same folder as this file).
 try:
-    import segyio
-except ImportError as exc:
-    raise ImportError("Please install segyio: pip install segyio") from exc
-
-# ---------------------------------------------------------------------------
-# Data Structure
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Volume3DSeismic:
-    """Container for a full 3D seismic volume."""
-    ilines: np.ndarray          # shape: (n_ilines,), int64
-    xlines: np.ndarray          # shape: (n_xlines,), int64
-    twt_ms: np.ndarray          # shape: (n_samples,), float64
-    dt_ms: float                # sample interval in ms
-    data: np.ndarray            # shape: (n_ilines, n_xlines, n_samples), float32 (to save memory)
-
-
-# ---------------------------------------------------------------------------
-# 1. Fault-Tolerant 3D Loader
-# ---------------------------------------------------------------------------
-
-def _extract_time_axis(f: segyio.SegyFile, default_dt_ms: float = 4.0) -> Tuple[np.ndarray, float]:
-    """Safely extracts the Two-Way Time array and sample rate."""
-    raw_samples = getattr(f, "samples", None)
-
-    try:
-        dt_us = segyio.tools.dt(f)
-        dt_ms = float(dt_us) / 1000.0 if dt_us and dt_us > 0 else default_dt_ms
-    except Exception:
-        dt_ms = default_dt_ms
-
-    if raw_samples is not None and len(raw_samples) > 0:
-        twt_ms = np.asarray(raw_samples, dtype=np.float64)
-        if len(twt_ms) >= 2:
-            inferred_dt = float(twt_ms[1] - twt_ms[0])
-            if inferred_dt > 0:
-                dt_ms = inferred_dt
-    else:
-        n_samples = f.trace.shape if isinstance(f.trace.shape, int) else len(f.trace[0])
-        twt_ms = np.arange(n_samples, dtype=np.float64) * dt_ms
-
-    return twt_ms, dt_ms
-
-
-def read_3d_volume(
-    segy_path: Union[str, Path],
-    iline_byte: int = 189,
-    xline_byte: int = 193,
-) -> Volume3DSeismic:
-    """
-    Reads a full 3D SEG-Y volume into memory.
-    Uses segyio's fast cube if regular, falls back to manual memory mapping if irregular.
-    """
-    segy_path = Path(segy_path)
-    if not segy_path.exists():
-        raise FileNotFoundError(f"SEG-Y file not found: {segy_path}")
-
-    try:
-        # Attempt 1: Fast 3D regular grid mode
-        with segyio.open(
-            str(segy_path), mode="r", iline=iline_byte, xline=xline_byte, strict=True
-        ) as f:
-            if f.ilines is None or f.xlines is None:
-                raise RuntimeError("Irregular grid detected. Falling back to trace mapping.")
-
-            ilines = np.asarray(f.ilines, dtype=np.int64)
-            xlines = np.asarray(f.xlines, dtype=np.int64)
-            twt_ms, dt_ms = _extract_time_axis(f)
-
-            # Load full cube. Cast to float32 immediately to save 50% RAM.
-            data = segyio.tools.cube(f).astype(np.float32)
-            data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
-
-            return Volume3DSeismic(ilines, xlines, twt_ms, dt_ms, data)
-
-    except Exception as e:
-        # Attempt 2: Unstructured Fallback (Trace-by-Trace Mapping)
-        print(f"      [!] Fast 3D load failed ({type(e).__name__}). Constructing 3D grid manually...")
-
-        with segyio.open(str(segy_path), mode="r", ignore_geometry=True) as f:
-            twt_ms, dt_ms = _extract_time_axis(f)
-
-            # 1. Read all headers to determine the exact grid boundaries
-            all_ilines = np.asarray(f.attributes(iline_byte)[:], dtype=np.int64)
-            all_xlines = np.asarray(f.attributes(xline_byte)[:], dtype=np.int64)
-
-            ilines = np.unique(all_ilines)
-            xlines = np.unique(all_xlines)
-
-            if ilines.size == 0 or xlines.size == 0:
-                raise ValueError(f"Could not find valid headers at bytes IL={iline_byte}, XL={xline_byte}")
-
-            # 2. ???
-            il_idx = np.searchsorted(ilines, all_ilines)
-            xl_idx = np.searchsorted(xlines, all_xlines)
-
-            # 3. Pre-allocate the 3D volume filled with zeros (using float32 to protect RAM)
-            n_il, n_xl, n_samp = len(ilines), len(xlines), len(twt_ms)
-            data3d = np.zeros((n_il, n_xl, n_samp), dtype=np.float32)
-
-            # 4. Stream traces into their exact 3D coordinate slot
-            # (Dead/missing traces in the survey simply remain as 0.0)
-            print(f"      Mapping {f.tracecount} traces to [{n_il} IL x {n_xl} XL] grid...")
-            data3d[il_idx, xl_idx] = f.trace.raw[:]
-
-            data3d = np.nan_to_num(data3d, nan=0.0, posinf=0.0, neginf=0.0)
-
-            return Volume3DSeismic(ilines, xlines, twt_ms, dt_ms, data3d)
-
-
-# ---------------------------------------------------------------------------
-# 2. 3D Volume Alignment (Intersection)
-# ---------------------------------------------------------------------------
-
-def align_3d_volumes(
-    base_vol: Volume3DSeismic,
-    mon_vol: Volume3DSeismic,
-) -> Tuple[Volume3DSeismic, Volume3DSeismic]:
-    """
-    Slices both 3D matrices so they share the exact same Inline, Crossline, and Time limits.
-    """
-    # Find intersecting Inlines and Crosslines
-    common_ilines, base_il_idx, mon_il_idx = np.intersect1d(base_vol.ilines, mon_vol.ilines, return_indices=True)
-    common_xlines, base_xl_idx, mon_xl_idx = np.intersect1d(base_vol.xlines, mon_vol.xlines, return_indices=True)
-
-    if len(common_ilines) == 0 or len(common_xlines) == 0:
-        raise ValueError("Baseline and Monitor have ZERO spatial overlap! Check header byte positions.")
-
-    # Find common time samples (truncate to the shortest trace)
-    n_samples = min(len(base_vol.twt_ms), len(mon_vol.twt_ms))
-    twt_ms = base_vol.twt_ms[:n_samples]
-
-    # Slice Baseline Data: axis 0 (ilines), then axis 1 (xlines), then axis 2 (time)
-    b_data = base_vol.data[base_il_idx, :, :]
-    b_data = b_data[:, base_xl_idx, :]
-    b_data = b_data[:, :, :n_samples]
-
-    aligned_base = Volume3DSeismic(
-        ilines=common_ilines,
-        xlines=common_xlines,
-        twt_ms=twt_ms,
-        dt_ms=base_vol.dt_ms,
-        data=b_data,
-    )
-
-    # Slice Monitor Data
-    m_data = mon_vol.data[mon_il_idx, :, :]
-    m_data = m_data[:, mon_xl_idx, :]
-    m_data = m_data[:, :, :n_samples]
-
-    aligned_mon = Volume3DSeismic(
-        ilines=common_ilines,
-        xlines=common_xlines,
-        twt_ms=twt_ms,
-        dt_ms=mon_vol.dt_ms,
-        data=m_data,
-    )
-
-    return aligned_base, aligned_mon
-
-
-# ---------------------------------------------------------------------------
-# 3. Core Loader Entrypoint
-# ---------------------------------------------------------------------------
-
-CACHE = "/data/epic20/APGCE/apgce_team_07/dtw/qc_images"
-def load_and_align_3d_pair(
-    base_path: Union[str, Path],
-    monitor_path: Union[str, Path],
-    iline_byte: int = 189,
-    xline_byte: int = 193,
-) -> Tuple[Volume3DSeismic, Volume3DSeismic]:
-    """
-    Reads whole Baseline and Monitor volumes, aligns them, and returns two matching 3D matrices.
-    """
-    print(f"[1/3] Reading Baseline 3D Volume: {base_path}")
-    base_vol = read_3d_volume(base_path, iline_byte, xline_byte)
-
-    print(f"[2/3] Reading Monitor 3D Volume: {monitor_path}")
-    mon_vol = read_3d_volume(monitor_path, iline_byte, xline_byte)
-
-    print(f"[3/3] Aligning 3D geometries...")
-    base_aligned, mon_aligned = align_3d_volumes(base_vol, mon_vol)
-
-    n_il = len(base_aligned.ilines)
-    n_xl = len(base_aligned.xlines)
-    n_samp = len(base_aligned.twt_ms)
-
-    print(f"      -> Success! Aligned 3D Volumes to shape: [{n_il} IL x {n_xl} XL x {n_samp} Samples]")
-
-    np.save(f'{CACHE}/base_aligned.npy', base_aligned)
-    np.save(f'{CACHE}/mon_aligned.npy', mon_aligned)
-
-    return base_aligned, mon_aligned
-
-def load_cache_or_load_and_align_3d_pair(
-    base_path: Union[str, Path],
-    monitor_path: Union[str, Path],
-    iline_byte: int = 189,
-    xline_byte: int = 193,
-) -> Tuple[Volume3DSeismic, Volume3DSeismic]:
-    try:
-        base_aligned = np.load(f'{CACHE}/base_aligned.npy', allow_pickle=True).item()
-        mon_aligned = np.load(f'{CACHE}/mon_aligned.npy', allow_pickle=True).item()
-        return base_aligned, mon_aligned
-    except:
-        return load_and_align_3d_pair(base_path, monitor_path, iline_byte, xline_byte)
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+except NameError:  # pasted into a notebook cell: run it from the repo folder
+    sys.path.insert(0, str(Path.cwd()))
+from volume3d import Volume3DSeismic, load_cache_or_load_and_align_3d_pair  # noqa: E402
 
 
 # In[2]:
@@ -308,6 +103,41 @@ import matplotlib.pyplot as plt
 DIR = '/data/epic20/APGCE/apgce_team_07/friday/ilcl_pics'
 NORM = Normalize(vmin=-1e5, vmax=1e5, clip=True)
 
+# 4D difference (monitor - baseline) pictures of the same sections, saved next to the
+# baseline ones as hex<ID>_IL_<inline>_diff.png / hex<ID>_CL_<crossline>_diff.png
+DIFF = True
+DIFF_CMAP = 'seismic'   # blue = weaker in the monitor, red = stronger, white = no change
+DIFF_VMAX = None        # colour range -DIFF_VMAX..DIFF_VMAX; None = 99th percentile of |difference|
+
+
+def difference_vmax(base_vol, mon_vol, target=2_000_000):
+    """99th percentile of |monitor - baseline| from an evenly spread sample of the volume."""
+    n_il, n_xl, n_t = base_vol.data.shape
+    step = max(1, int(np.sqrt(n_il * n_xl * n_t / target)))
+    d = np.asarray(mon_vol.data[::step, ::step, :], dtype=np.float32) - \
+        np.asarray(base_vol.data[::step, ::step, :], dtype=np.float32)
+    a = np.abs(d)
+    v = float(np.percentile(a, 99))
+    if v <= 0:  # the change covers under 1% of the samples: scale on the samples that changed
+        a = a[a > 0]
+        v = float(np.percentile(a, 99)) if a.size else 1.0
+    return v
+
+
+def save_section(section, x_first, x_last, title, path, cmap, norm, invert_x=False):
+    plt.clf()
+    plt.imshow(
+        np.asarray(section, dtype=np.float32).T,
+        cmap=cmap,
+        norm=norm,
+        # aspect='auto',
+        extent=(x_first, x_last, base_vol.twt_ms.max(), base_vol.twt_ms.min())
+    )
+    if invert_x:
+        plt.gca().invert_xaxis()
+    plt.title(title)
+    plt.savefig(path)
+
 
 def hex_chord(corners, value, axis):
     """Where one line crosses the hexagon.
@@ -358,6 +188,13 @@ def hex_name(hex_id):
     return f"hex{hex_id:02d}" if isinstance(hex_id, (int, np.integer)) else f"hex{hex_id}"
 
 
+if DIFF:
+    if base_vol.data.shape != mon_vol.data.shape:
+        raise ValueError("base_vol and mon_vol must be aligned (same lines and times) for difference pictures")
+    diff_vmax = DIFF_VMAX or difference_vmax(base_vol, mon_vol)
+    DIFF_NORM = Normalize(vmin=-diff_vmax, vmax=diff_vmax, clip=True)
+    print(f"Difference pictures: monitor - baseline, colour range +-{diff_vmax:.4g}")
+
 saved, skipped = 0, []
 for hex_id, (center_iline, center_xline) in HEXAGONS.items():
     corners = hexagon(center_iline, center_xline)
@@ -376,20 +213,18 @@ for hex_id, (center_iline, center_xline) in HEXAGONS.items():
         j0, j1 = index_range(base_vol.xlines, *chord)  # the crosslines inside the hexagon on this inline
         if j1 - j0 < 2:
             continue
-        plt.clf()
-        plt.imshow(
-            base_vol.data[il_idx, j0:j1, :].T,
-            cmap='Seismic RWB',
-            norm=NORM,
-            # aspect='auto',
-            extent=(base_vol.xlines[j0], base_vol.xlines[j1 - 1], base_vol.twt_ms.max(), base_vol.twt_ms.min())
-        )
-        plt.gca().invert_xaxis()  # crosslines decreasing to the right, as before
-        plt.title(f'{name} · Inline {iline}')
+        x0, x1 = base_vol.xlines[j0], base_vol.xlines[j1 - 1]
+        base = base_vol.data[il_idx, j0:j1, :]
         path = f'{DIR}/{name}_IL_{iline}.png'
-        plt.savefig(path)
+        # invert_x: crosslines decreasing to the right, as before
+        save_section(base, x0, x1, f'{name} · Inline {iline}', path, 'Seismic RWB', NORM, invert_x=True)
         saved += 1
-        print(f'  saved {path}')
+        if DIFF:
+            diff = np.asarray(mon_vol.data[il_idx, j0:j1, :], dtype=np.float32) - np.asarray(base, dtype=np.float32)
+            save_section(diff, x0, x1, f'{name} · Inline {iline} · monitor - baseline',
+                         path.replace('.png', '_diff.png'), DIFF_CMAP, DIFF_NORM, invert_x=True)
+            saved += 1
+        print(f'  saved {path}' + (' + _diff' if DIFF else ''))
 
     for xl_idx in lines_across(corners, base_vol.xlines, axis=1):
         xline = base_vol.xlines[xl_idx]
@@ -399,19 +234,17 @@ for hex_id, (center_iline, center_xline) in HEXAGONS.items():
         i0, i1 = index_range(base_vol.ilines, *chord)  # the inlines inside the hexagon on this crossline
         if i1 - i0 < 2:
             continue
-        plt.clf()
-        plt.imshow(
-            base_vol.data[i0:i1, xl_idx, :].T,
-            cmap='Seismic RWB',
-            norm=NORM,
-            # aspect='auto',
-            extent=(base_vol.ilines[i0], base_vol.ilines[i1 - 1], base_vol.twt_ms.max(), base_vol.twt_ms.min())
-        )
-        plt.title(f'{name} · Crossline {xline}')
+        x0, x1 = base_vol.ilines[i0], base_vol.ilines[i1 - 1]
+        base = base_vol.data[i0:i1, xl_idx, :]
         path = f'{DIR}/{name}_CL_{xline}.png'
-        plt.savefig(path)
+        save_section(base, x0, x1, f'{name} · Crossline {xline}', path, 'Seismic RWB', NORM)
         saved += 1
-        print(f'  saved {path}')
+        if DIFF:
+            diff = np.asarray(mon_vol.data[i0:i1, xl_idx, :], dtype=np.float32) - np.asarray(base, dtype=np.float32)
+            save_section(diff, x0, x1, f'{name} · Crossline {xline} · monitor - baseline',
+                         path.replace('.png', '_diff.png'), DIFF_CMAP, DIFF_NORM)
+            saved += 1
+        print(f'  saved {path}' + (' + _diff' if DIFF else ''))
 
 print(f"Saved {saved} pictures of {len(HEXAGONS) - len(skipped)} of {len(HEXAGONS)} hexagons in {DIR}"
       + (f" (outside the survey: {', '.join(skipped)})" if skipped else ""))
