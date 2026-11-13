@@ -703,12 +703,168 @@ title_block = html(
 """
 )
 
-# Light / dark mode: the browser swaps the CSS variables instantly (jscallback),
-# and Python restyles the plots (on_theme_change, further down).
-theme_toggle = pn.widgets.Toggle(name="☀  Light mode", value=DEFAULT_THEME == "light",
-                                 stylesheets=[BTN_BASE_CSS, ".bk-btn.bk-active { background: transparent !important; }"],
-                                 margin=(5, 10))
-theme_toggle.jscallback(value="document.documentElement.classList.toggle('light', cb_obj.active);")
+# Light / dark mode switch (on = light): the browser swaps the CSS variables
+# instantly (jscallback), and Python restyles the plots (on_theme_change, further down).
+# The knob shows a moon in dark mode and a sun in light mode.
+_MOON_SVG = ("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'>"
+             "<path d='M20.5 14.2A8.6 8.6 0 1 1 9.8 3.5a6.8 6.8 0 0 0 10.7 10.7z'/></svg>")
+_SUN_SVG = ("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' "
+            "stroke='black' stroke-width='2.2' stroke-linecap='round'><circle cx='12' cy='12' r='4.2' fill='black'/>"
+            "<path d='M12 2v2.4M12 19.6V22M4.9 4.9l1.7 1.7M17.4 17.4l1.7 1.7M2 12h2.4M19.6 12H22M4.9 19.1l1.7-1.7"
+            "M17.4 6.6l1.7-1.7'/></svg>")
+THEME_SWITCH_CSS = """
+:host { gap: 0 !important; }
+.bk-label, .bk-icon { display: none !important; }
+.bk-body { width: 58px !important; height: 30px !important; }
+.bk-bar {
+  position: absolute !important; inset: 0 !important; top: 0 !important; height: 100% !important;
+  box-sizing: border-box; border-radius: 15px !important;
+  background: var(--card2) !important; border: 1px solid var(--border-strong);
+  transition: background-color .25s ease, border-color .25s ease;
+}
+/* faint sun (right) and moon (left) in the track; the knob covers the current one */
+.bk-bar::before, .bk-bar::after {
+  content: ""; position: absolute; top: 50%; width: 14px; height: 14px; margin-top: -7px;
+  background: var(--muted); opacity: .8;
+  -webkit-mask: var(--icon) center / contain no-repeat; mask: var(--icon) center / contain no-repeat;
+}
+.bk-bar::before { right: 8px; --icon: url("SUN"); }
+.bk-bar::after { left: 8px; --icon: url("MOON"); }
+.bk-knob {
+  top: 3px !important; left: 3px !important; width: 24px !important; height: 24px !important;
+  border-radius: 50% !important; background: var(--accent) !important; z-index: 1;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .35);
+  transition: left .25s cubic-bezier(.3, .7, .4, 1), background-color .25s ease !important;
+}
+.bk-knob::after {
+  content: ""; position: absolute; inset: 5px; background: var(--accent-ink);
+  -webkit-mask: url("MOON") center / contain no-repeat; mask: url("MOON") center / contain no-repeat;
+}
+:host(.bk-active) .bk-bar { background: var(--accent-soft) !important; border-color: var(--accent); }
+:host(.bk-active) .bk-knob { left: 31px !important; }
+:host(.bk-active) .bk-knob::after { -webkit-mask-image: url("SUN"); mask-image: url("SUN"); }
+.bk-body:hover .bk-bar { border-color: var(--accent); }
+.bk-knob:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+""".replace("SUN", _SUN_SVG).replace("MOON", _MOON_SVG)
+
+theme_toggle = pn.widgets.Switch(name="", value=DEFAULT_THEME == "light",
+                                 stylesheets=[THEME_SWITCH_CSS], margin=(5, 10), align="center")
+
+# Easter egg: flipping the theme switch 10 times within 3 seconds splatters oil
+# over the screen for 5 seconds. Runs entirely in the browser; the overlay
+# ignores the mouse, so the app stays usable underneath.
+OIL_SPLATTER_JS = r"""
+const now = Date.now();
+const clicks = (window.__oilClicks || []).filter(t => now - t < 3000);
+clicks.push(now);
+window.__oilClicks = clicks;
+if (clicks.length >= 10 && !window.__oilActive) {
+  window.__oilClicks = [];
+  window.__oilActive = true;
+  const NS = 'http://www.w3.org/2000/svg';
+  const W = window.innerWidth, H = window.innerHeight;
+  const unit = Math.min(W, H) / 900;
+  const still = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const el = (tag, attrs, parent) => {
+    const e = document.createElementNS(NS, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  };
+  const animate = (e, frames, opts) => { if (!still && e.animate) e.animate(frames, opts); };
+
+  // irregular closed blob: random radii round a circle, smoothed through midpoints
+  const blob = (cx, cy, r, n) => {
+    const pts = [];
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2 + rand(-0.15, 0.15);
+      const rr = r * rand(0.7, 1.15) * (Math.random() < 0.3 ? rand(1.2, 1.6) : 1);
+      pts.push([cx + Math.cos(a) * rr, cy + Math.sin(a) * rr]);
+    }
+    const mid = (p, q) => [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2];
+    const s = mid(pts[n - 1], pts[0]);
+    let d = 'M' + s[0].toFixed(1) + ',' + s[1].toFixed(1);
+    for (let i = 0; i < n; i++) {
+      const m = mid(pts[i], pts[(i + 1) % n]);
+      d += ' Q' + pts[i][0].toFixed(1) + ',' + pts[i][1].toFixed(1) + ' ' + m[0].toFixed(1) + ',' + m[1].toFixed(1);
+    }
+    return d + 'Z';
+  };
+
+  const svg = el('svg', {width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, 'aria-hidden': 'true'});
+  svg.style.cssText = 'position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;' +
+                      'transition:opacity 1s ease;filter:drop-shadow(0 4px 6px rgba(0,0,0,.35));';
+  const defs = el('defs', {}, svg);
+  const fill = el('radialGradient', {id: 'oil-fill', cx: '38%', cy: '32%', r: '80%'}, defs);
+  [['0%', '#2b1e0d'], ['35%', '#110b05'], ['100%', '#020101']].forEach(
+    ([o, c]) => el('stop', {offset: o, 'stop-color': c}, fill));
+  const sheen = el('linearGradient', {id: 'oil-sheen', x1: '0', y1: '0', x2: '1', y2: '1'}, defs);
+  [['0%', '#6fd3ff', '.10'], ['30%', '#000', '0'], ['55%', '#c77dff', '.08'], ['80%', '#000', '0'],
+   ['100%', '#ffd166', '.10']].forEach(
+    ([o, c, a]) => el('stop', {offset: o, 'stop-color': c, 'stop-opacity': a}, sheen));
+
+  const count = Math.round(rand(6, 9));
+  for (let k = 0; k < count; k++) {
+    const cx = rand(0.08, 0.92) * W, cy = rand(0.08, 0.85) * H;
+    const r = rand(45, 130) * unit;
+    const delay = k * 110;
+    const g = el('g', {}, svg);
+
+    // drips run down from the lower half of the splat
+    const drips = Math.round(rand(1, 3.4));
+    for (let i = 0; i < drips; i++) {
+      const w = r * rand(0.1, 0.2), len = r * rand(1.4, 3.4);
+      const x = cx + rand(-0.55, 0.55) * r;
+      const drip = el('g', {}, g);
+      el('rect', {x: x - w / 2, y: cy, width: w, height: len, rx: w / 2, fill: 'url(#oil-fill)'}, drip);
+      el('circle', {cx: x, cy: cy + len, r: w * 0.75, fill: 'url(#oil-fill)'}, drip);
+      drip.style.transformBox = 'fill-box';
+      drip.style.transformOrigin = 'top';
+      animate(drip, [{transform: 'scaleY(0)'}, {transform: 'scaleY(1)'}],
+              {duration: rand(1600, 3000), delay: delay + 150, easing: 'cubic-bezier(.4,0,.8,.7)', fill: 'both'});
+    }
+
+    // the splat itself, with a rainbow oil sheen and a glossy highlight
+    const splat = el('g', {}, g);
+    const d = blob(cx, cy, r, Math.round(rand(14, 20)));
+    // splash arms: tapered streaks thrown out from the impact, each ending in a droplet
+    const arms = Math.round(rand(6, 11));
+    for (let i = 0; i < arms; i++) {
+      const a = rand(0, Math.PI * 2), L = r * rand(1.15, 2.1), bw = r * rand(0.14, 0.3);
+      const ux = Math.cos(a), uy = Math.sin(a), px = -uy, py = ux;
+      const at = (along, side) => (cx + ux * along + px * side).toFixed(1) + ',' + (cy + uy * along + py * side).toFixed(1);
+      el('path', {d: 'M' + at(r * 0.5, bw / 2) + ' Q' + at(L * 0.72, bw * 0.12) + ' ' + at(L, 0) +
+                     ' Q' + at(L * 0.72, -bw * 0.12) + ' ' + at(r * 0.5, -bw / 2) + 'Z', fill: 'url(#oil-fill)'}, splat);
+      el('circle', {cx: cx + ux * (L + bw * 0.15), cy: cy + uy * (L + bw * 0.15), r: bw * rand(0.3, 0.45),
+                    fill: 'url(#oil-fill)'}, splat);
+    }
+    el('path', {d: d, fill: 'url(#oil-fill)'}, splat);
+    el('path', {d: d, fill: 'url(#oil-sheen)'}, splat);
+    el('ellipse', {cx: cx - r * 0.3, cy: cy - r * 0.32, rx: r * 0.28, ry: r * 0.1, fill: '#fff', opacity: '.22',
+                   transform: 'rotate(-28 ' + (cx - r * 0.3) + ' ' + (cy - r * 0.32) + ')'}, splat);
+    el('ellipse', {cx: cx - r * 0.05, cy: cy - r * 0.48, rx: r * 0.07, ry: r * 0.035, fill: '#fff', opacity: '.35'}, splat);
+
+    // flung droplets around it
+    const drops = Math.round(rand(6, 13));
+    for (let i = 0; i < drops; i++) {
+      const a = rand(0, Math.PI * 2), dist = r * rand(1.1, 2.6);
+      el('circle', {cx: cx + Math.cos(a) * dist, cy: cy + Math.sin(a) * dist,
+                    r: r * rand(0.025, 0.09), fill: 'url(#oil-fill)'}, splat);
+    }
+    splat.style.transformBox = 'fill-box';
+    splat.style.transformOrigin = 'center';
+    animate(splat, [{transform: 'scale(.15)', opacity: 0}, {transform: 'scale(1.08)', opacity: 1, offset: 0.6},
+                    {transform: 'scale(1)', opacity: 1}],
+            {duration: 380, delay: delay, easing: 'cubic-bezier(.2,.8,.3,1)', fill: 'both'});
+  }
+
+  document.body.appendChild(svg);
+  setTimeout(() => { svg.style.opacity = '0'; }, 4000);  // fade over the last second
+  setTimeout(() => { svg.remove(); window.__oilActive = false; }, 5000);
+}
+"""
+theme_toggle.jscallback(value="document.documentElement.classList.toggle('light', cb_obj.active);\n" + OIL_SPLATTER_JS)
 
 header = pn.Row(
     title_block,
@@ -2105,7 +2261,6 @@ load_btn.on_click(rebuild)
 
 def on_theme_change(event):
     ws["theme"] = "light" if event.new else "dark"
-    set_label(theme_toggle, "☾  Dark mode" if event.new else "☀  Light mode")
     for p in ws["figs"] + ws["afigs"]:
         style_figure(p)
 
