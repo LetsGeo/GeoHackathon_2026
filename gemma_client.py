@@ -17,6 +17,11 @@ Settings (environment variables, or the --gemma-* options of app.py):
     GEMMA_API_KEY    default "token-not-needed" (the client needs some value)
     GEMMA_TIMEOUT    seconds, default 120
     GEMMA_IMAGES     1 (default) sends the two pictures, 0 sends numbers only
+    GEMMA_WORKERS    fault screening: requests sent at the same time, default 4
+
+Fault screening (classify_fault) sends, for one hexagon, two montages of 5 inlines
+and 5 crosslines (monitor amplitude and 4D difference) plus the hex's attributes,
+and asks whether a fault crosses it and whether that fault seals the CO2.
 
 Check the connection from the machine that runs the app:
     python gemma_client.py
@@ -73,6 +78,7 @@ def settings(base_url=None, model=None):
         "api_key": os.environ.get("GEMMA_API_KEY", "token-not-needed"),
         "timeout": float(os.environ.get("GEMMA_TIMEOUT", "120")),
         "images": os.environ.get("GEMMA_IMAGES", "1").strip().lower() not in ("0", "false", "no", "off"),
+        "workers": max(1, int(os.environ.get("GEMMA_WORKERS", "4"))),
     }
 
 
@@ -81,8 +87,14 @@ def make_client(cfg):
         import openai
     except ImportError as exc:
         raise GemmaError("the 'openai' package is not installed (pip install openai)") from exc
+    timeout = cfg["timeout"]
+    try:  # fail fast when the server can't be reached at all
+        import httpx
+        timeout = httpx.Timeout(cfg["timeout"], connect=min(10.0, cfg["timeout"]))
+    except ImportError:
+        pass
     return openai.OpenAI(base_url=cfg["base_url"], api_key=cfg["api_key"],
-                         timeout=cfg["timeout"], max_retries=0)
+                         timeout=timeout, max_retries=0)
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +293,116 @@ def summarise(vol, sl, base_label, mon_label, draft=None, slice_axes=None, base_
         result = parse_answer(ask(text_only))
     result["en"]["note"] = NOTE_EN.format(model=cfg["model"])
     result["ms"]["note"] = NOTE_MS.format(model=cfg["model"])
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Fault screening: one hexagon at a time
+# ---------------------------------------------------------------------------
+FAULT_SYSTEM_PROMPT = """You are an experienced seismic interpreter screening a CO2 storage
+site for sealing faults, one small area (a hexagon about 20 lines across) at a time.
+
+You get two images of the same 10 sections through the hexagon: top row = 5 inlines,
+bottom row = 5 crosslines, time (ms) increasing downwards.
+- Image 1, monitor amplitude (grey): look for a FAULT = reflectors that are offset
+  (shifted up or down) or cut off along a steep line, at a consistent position in
+  neighbouring panels. Gentle dip or folding is not a fault.
+- Image 2, 4D difference (monitor - baseline; blue = weaker, orange = stronger, white
+  = no change): coloured events show where CO2 changed the rock.
+- A SEALING fault: the 4D change (CO2) reaches the fault and stops abruptly against it,
+  so the change is on one side only. If the change continues across the fault, it is
+  not sealing. If no 4D change reaches the fault, sealing cannot be tested ("n/a").
+
+You also get attributes measured by the app for the hexagon. Key ones:
+- fault_score (0-1): discontinuous traces that line up (1 = clear linear break)
+- throw_ms: apparent vertical offset across the break; fault_trend_deg: its direction
+- seal_contrast (0-1): 4D change on one side of the break vs the other (1 = one side only)
+- seal_score = fault_score x seal_contrast; changed_pct: % of traces with 4D change
+Use the images first and the attributes to confirm; if they disagree, say so and
+lower your confidence. Never invent line numbers or times that are not in the images.
+
+Reply with ONE JSON object and nothing else:
+{"fault": "yes" | "no" | "unsure",
+ "sealing": "yes" | "no" | "unsure" | "n/a",
+ "confidence": number from 0 to 1,
+ "location": "where the fault is: which panels, about which crossline/inline and time range (short)",
+ "evidence_en": "2-3 sentences in English explaining the decision",
+ "evidence_ms": "the same 2-3 sentences in Bahasa Melayu"}"""
+
+FAULT_VALUES = {"fault": ("yes", "no", "unsure"), "sealing": ("yes", "no", "unsure", "n/a")}
+
+
+def _png_url(png_bytes):
+    return "data:image/png;base64," + base64.b64encode(png_bytes).decode()
+
+
+def parse_fault_answer(text):
+    if not text:
+        raise GemmaError("empty answer")
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        raise GemmaError("the answer contained no JSON")
+    try:
+        data = json.loads(text[start:end + 1])
+    except json.JSONDecodeError as exc:
+        raise GemmaError(f"the answer was not valid JSON ({exc.msg})") from exc
+    if not isinstance(data, dict):
+        raise GemmaError("the answer was not a JSON object")
+    out = {}
+    for key, allowed in FAULT_VALUES.items():
+        v = str(data.get(key, "")).strip().lower()
+        v = {"true": "yes", "false": "no", "na": "n/a", "none": "n/a", "not applicable": "n/a"}.get(v, v)
+        if v not in allowed:
+            raise GemmaError(f"'{key}' must be one of {', '.join(allowed)} (got {v!r})")
+        out[key] = v
+    try:
+        out["confidence"] = float(min(1.0, max(0.0, float(data.get("confidence", 0)))))
+    except (TypeError, ValueError):
+        out["confidence"] = 0.0
+    for key in ("location", "evidence_en", "evidence_ms"):
+        out[key] = str(data.get(key, "")).strip()
+    return out
+
+
+def classify_fault(attributes, amp_png, diff_png, labels=("Baseline", "Monitor"), context=None,
+                   base_url=None, model=None, client=None):
+    """Ask Gemma whether a sealing fault crosses one hexagon.
+    attributes: dict of the hex's measurements; amp_png / diff_png: montage PNG bytes.
+    Returns {"fault", "sealing", "confidence", "location", "evidence_en", "evidence_ms", "model"}.
+    Raises GemmaError on any problem."""
+    cfg = settings(base_url, model)
+    client = client or make_client(cfg)
+    facts = {"baseline_survey": labels[0], "monitor_survey": labels[1], "hexagon": attributes}
+    if context:
+        facts["survey_reference"] = context
+    text = ("Hexagon attributes (JSON):\n" + json.dumps(facts, ensure_ascii=False, indent=1)
+            + "\n\nImage 1 = monitor amplitude, image 2 = 4D difference. Is there a fault, and does it seal?")
+    content = [{"type": "text", "text": text},
+               {"type": "image_url", "image_url": {"url": _png_url(amp_png)}},
+               {"type": "image_url", "image_url": {"url": _png_url(diff_png)}}]
+    messages = [{"role": "system", "content": FAULT_SYSTEM_PROMPT}, {"role": "user", "content": content}]
+
+    def ask(msgs):
+        try:
+            resp = client.chat.completions.create(model=cfg["model"], messages=msgs,
+                                                  temperature=0.1, max_tokens=700)
+        except Exception as exc:
+            raise GemmaError(f"{type(exc).__name__}: {exc}") from exc
+        return (resp.choices[0].message.content or "") if resp.choices else ""
+
+    answer = ask(messages)
+    try:
+        result = parse_fault_answer(answer)
+    except GemmaError as exc:
+        if "empty" in str(exc):
+            raise
+        # one retry: show the model its reply and ask for the exact format
+        retry = messages + [{"role": "assistant", "content": answer[:2000]},
+                            {"role": "user", "content": f"That reply could not be used ({exc}). "
+                                                        "Reply again with only the JSON object in the required format."}]
+        result = parse_fault_answer(ask(retry))
+    result["model"] = cfg["model"]
     return result
 
 

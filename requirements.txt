@@ -3,4 +3,5 @@ bokeh>=3.4
 segyio
 numpy
 matplotlib
+pillow
 openai>=1.0

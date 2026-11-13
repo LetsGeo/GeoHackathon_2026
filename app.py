@@ -11,7 +11,7 @@ when starting it, e.g.:
 Optional: --inline 1840 (starting inline)   --credit "Data: ..."   (paths can be absolute, or
 relative to this file's folder)
 
-Needs:  pip install -r requirements.txt   (panel, segyio, numpy, matplotlib, openai)
+Needs:  pip install -r requirements.txt   (panel, segyio, numpy, matplotlib, pillow, openai)
 
 Analysis summary by Gemma: "Run analysis" sends the measurements to a Gemma model
 behind an OpenAI-compatible server (default http://172.28.34.1:8000/v1, model
@@ -19,6 +19,15 @@ google/gemma-4-26B-A4B-it) and shows its English + Malay summary. Change the ser
 with --gemma-url / --gemma-model (or GEMMA_BASE_URL / GEMMA_MODEL), turn it off with
 --no-gemma. If the server can't be reached the rule-based summary is shown instead.
 Check the connection with:  python gemma_client.py
+
+Fault screening ("Fault screening" card): tiles the shared area with hexagons 20 lines
+across, measures attributes on every trace (coherence, fault throw, 4D change, NRMS,
+time shift, envelope, instantaneous frequency, sweetness, seal contrast) and sends 5
+inlines + 5 crosslines of each hexagon to Gemma, which says whether a fault crosses it
+and whether it seals the CO2. Results: map, table, per-hexagon sections, CSV, PDF pages.
+GEMMA_WORKERS sets how many hexagons are sent at once (default 4). The same without the
+UI:  python hex_screen.py --baseline B.sgy --monitor M.sgy   (see hexscreen.py)
+
 The first load of a file reads the whole SEG-Y once and saves it in "cache/"
 (about the same size as the file), so inline, crossline and time slices are
 instant afterwards. Delete the cache folder any time to free the space.
@@ -29,8 +38,6 @@ import argparse
 import asyncio
 import base64
 import functools
-import gc
-import hashlib
 import io
 import os
 import subprocess
@@ -44,11 +51,13 @@ import numpy as np
 import panel as pn
 
 import gemma_client
+import hexscreen
+from seismic_io import load_cube
 import param
 from bokeh.models import Button as BkButton
 from bokeh.models import (
-    BoxZoomTool, ColorBar, ColumnDataSource, CustomAction, CustomJS, HoverTool, LinearColorMapper, PanTool, Range1d,
-    ResetTool, Span, WheelZoomTool,
+    BoxZoomTool, ColorBar, ColumnDataSource, CustomAction, CustomJS, HoverTool, LinearColorMapper, PanTool, Patches,
+    Range1d, ResetTool, Span, TapTool, WheelZoomTool,
 )
 from bokeh.plotting import figure
 
@@ -255,6 +264,29 @@ h1 {{ font-size: 20px; font-weight: 600; margin: 4px 0 0; }}
 .sum-col p.sum-note {{ font-size: 11.5px; color: {MUTED}; font-style: italic; margin-top: 10px; }}
 .morph-ends {{ display: flex; justify-content: space-between; font-family: {MONO};
                font-size: 11px; color: {TEXT_2}; }}
+.tiles.four {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
+.chip {{ display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600;
+         border: 1px solid currentColor; white-space: nowrap; }}
+.chip.likely {{ color: #e5484d; }} .chip.possible {{ color: #e8920c; }}
+.chip.fault {{ color: #6f8fb0; }} .chip.none {{ color: {MUTED}; }}
+.hex-table {{ width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 6px; }}
+.hex-table th {{ text-align: left; font-weight: 500; color: {MUTED}; font-size: 11px; padding: 6px 8px;
+                 border-bottom: 1px solid {BORDER}; }}
+.hex-table td {{ padding: 6px 8px; border-bottom: 1px solid {BORDER}; color: {TEXT_2};
+                 font-family: {MONO}; font-size: 12px; }}
+.hex-table td.txt {{ font-family: inherit; }}
+.hex-table tr.sel td {{ background: var(--accent-soft); }}
+.hex-detail h3 {{ font-size: 14px; margin: 4px 0 6px; color: {TEXT}; }}
+.hex-detail .lines {{ font-family: {MONO}; font-size: 11.5px; color: {MUTED}; margin-bottom: 8px; }}
+.hex-imgs {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }}
+.hex-detail img {{ width: 100%; height: auto; border-radius: 8px; border: 1px solid {BORDER};
+                   background: #fff; }}
+.attr-grid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px 14px; margin-top: 8px; }}
+.attr-grid div {{ font-size: 11px; color: {MUTED}; }}
+.attr-grid b {{ display: block; font-family: {MONO}; font-weight: 500; font-size: 12.5px; color: {TEXT}; }}
+.legend {{ display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 11.5px; color: {TEXT_2}; margin: 6px 0 2px; }}
+.legend i {{ display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 5px;
+             vertical-align: -1px; }}
 """
 
 CARD_STYLES = {
@@ -388,7 +420,6 @@ def html(content, **kwargs):
 # Data sources (nothing dataset-specific is hard-coded: these are only defaults)
 # ---------------------------------------------------------------------------
 APP_DIR = Path(__file__).parent
-CACHE_DIR = APP_DIR / "cache"
 
 SLEIPNER_CREDIT = (
     "Seismic data: Sleipner CO2 Reference Dataset, © The Sleipner Group "
@@ -436,10 +467,7 @@ def resolve_path(text):
 # ---------------------------------------------------------------------------
 # Seismic loading
 # ---------------------------------------------------------------------------
-# Byte positions where inline / crossline numbers are commonly stored in SEG-Y
-# trace headers. The loader tries each pair until one describes a proper 3D grid.
-HEADER_CANDIDATES = [(189, 193), (9, 21), (5, 21), (17, 13), (9, 13)]
-CHUNK_TRACES = 20_000  # traces read per step when building the cache
+# The SEG-Y reader and its cache live in seismic_io.py (load_cube).
 
 VIEWS = ("Inline", "Crossline", "Time slice")
 # per view: x-axis label, y-axis label, does y (time) increase downwards?
@@ -449,78 +477,6 @@ VIEW_AXES = {
     "Time slice": ("Crossline", "Inline", False),
 }
 VIEW_KEY = {"Inline": "ilines", "Crossline": "xlines", "Time slice": "times"}
-
-
-def cube_cache_dir(path):
-    """Cache folder tied to the file's full path, size and date, so different
-    datasets (even with the same file name) never share a cache."""
-    st = path.stat()
-    key = hashlib.sha1(f"{path.resolve()}|{st.st_size}|{st.st_mtime}".encode()).hexdigest()[:12]
-    return CACHE_DIR / f"{path.name}_{key}"
-
-
-def robust_amp(cube, target=2_000_000):
-    """99th percentile of |amplitude| from an evenly spaced sample of the cube."""
-    n_il, n_xl, _ = cube.shape
-    step = 1
-    while (n_il // step) * (n_xl // step) * cube.shape[2] > target and step < max(n_il, n_xl):
-        step += 1
-    sample = np.abs(np.asarray(cube[::step, ::step, :], dtype=np.float32))
-    value = np.nanpercentile(sample, 99) if np.isfinite(sample).any() else 1.0
-    return float(value)
-
-
-def load_cube(path):
-    """Open a 3D post-stack SEG-Y file as an (inline, crossline, time) array.
-    The first time, the whole file is read once and saved as cache/…/cube.npy
-    (about the same size as the SEG-Y). After that the cache is memory-mapped,
-    so any inline, crossline or time slice comes back instantly."""
-    folder = cube_cache_dir(path)
-    meta_file, cube_file = folder / "meta.npz", folder / "cube.npy"
-    if meta_file.exists() and cube_file.exists():
-        meta = np.load(meta_file)
-        return {
-            "cube": np.load(cube_file, mmap_mode="r"),
-            "ilines": meta["ilines"], "xlines": meta["xlines"], "times": meta["times"],
-            "amp": float(meta["amp"]),
-        }
-
-    import segyio  # imported here so the app still opens if segyio isn't installed
-
-    folder.mkdir(parents=True, exist_ok=True)
-    tmp_file = folder / "cube.partial.npy"
-    with segyio.open(str(path), ignore_geometry=True) as f:
-        f.mmap()
-        n = f.tracecount
-        il = xl = None
-        for il_byte, xl_byte in HEADER_CANDIDATES:
-            il_try = np.asarray(f.attributes(il_byte)[:]).astype(np.int64)
-            xl_try = np.asarray(f.attributes(xl_byte)[:]).astype(np.int64)
-            n_il, n_xl = len(np.unique(il_try)), len(np.unique(xl_try))
-            unique_pairs = len(np.unique(il_try * 10_000_000 + xl_try))
-            if n_il > 1 and n_xl > 1 and unique_pairs >= 0.95 * n:
-                il, xl = il_try, xl_try
-                break
-        if il is None:
-            raise ValueError("couldn't find inline/crossline numbers in the trace headers")
-
-        ilines, xlines = np.unique(il), np.unique(xl)
-        il_idx, xl_idx = np.searchsorted(ilines, il), np.searchsorted(xlines, xl)
-        times = np.asarray(f.samples, dtype=np.float32)
-
-        cube = np.lib.format.open_memmap(
-            tmp_file, mode="w+", dtype=np.float32, shape=(len(ilines), len(xlines), len(times)))
-        cube[:] = np.nan  # positions with no trace stay empty
-        for a in range(0, n, CHUNK_TRACES):
-            b = min(a + CHUNK_TRACES, n)
-            cube[il_idx[a:b], xl_idx[a:b], :] = f.trace.raw[a:b]
-        cube.flush()
-        amp = robust_amp(cube)
-    del cube
-    gc.collect()  # release the file so it can be renamed (needed on Windows)
-    tmp_file.replace(cube_file)
-    np.savez(meta_file, ilines=ilines, xlines=xlines, times=times, amp=amp)
-    return load_cube(path)
 
 
 def nice_round(x):
@@ -1318,7 +1274,8 @@ content = pn.Column(sizing_mode="stretch_width", margin=0)
 
 # Per-session workspace: loaded surveys and the live plot sources
 ws = {"surveys": [], "cards": [], "morph": None, "credit": "",
-      "theme": DEFAULT_THEME, "figs": [], "afigs": [], "analysis": None}
+      "theme": DEFAULT_THEME, "figs": [], "afigs": [], "analysis": None,
+      "hfigs": [], "hex": None}
 
 
 def build_views():
@@ -1471,6 +1428,7 @@ def rebuild(event=None):
     try:
         cfg = current_config()
         reset_analysis()
+        reset_hex()
         detach_views()
         ws["surveys"] = load_surveys(cfg)
         if all(s_["vol"] is None for s_ in ws["surveys"]):
@@ -2228,6 +2186,10 @@ def make_pdf():
             text_page(fig, title, [(h_vol, s["volume"]), (h_slice, s["slice"])], s["note"])
             footer(fig, page)
             pdf.savefig(fig)
+
+        # pages 4+: fault screening, when it has been run on these surveys
+        if ws.get("hex") and ws["hex"].get("done"):
+            fault_pdf_pages(pdf, ws["hex"], 4, stamp)
     buf.seek(0)
     return buf
 
@@ -2256,12 +2218,592 @@ analysis_card = pn.Column(
 )
 
 
+# ---------------------------------------------------------------------------
+# Fault screening: hexagons + trace attributes + Gemma (logic in hexscreen.py)
+# ---------------------------------------------------------------------------
+VERDICT_COLOURS = {"likely": "#e5484d", "possible": "#f5a524", "fault": "#6f8fb0"}
+HEX_COLOUR_BY = {"Verdict": None, "Fault score": "fault_score", "Seal score": "seal_score",
+                 "4D change": "diff_rms", "Throw": "throw_ms"}
+GEMMA_WORKERS = gemma_client.settings()["workers"]
+HEX_INTRO = ('<span class="status">Tiles the shared area with hexagons 20 lines across, measures attributes on '
+             'every trace, and asks Gemma to look for sealing faults in 5 inlines and 5 crosslines per hex.</span>')
+
+hex_run_btn = pn.widgets.Button(name="Run fault screening", stylesheets=[BTN_BASE_CSS, PRIMARY_BTN_CSS], width=170)
+hex_status = html(HEX_INTRO, sizing_mode="stretch_width", align="center")
+hex_colour = pn.widgets.RadioButtonGroup(options=list(HEX_COLOUR_BY), value="Verdict", stylesheets=[TOGGLE_CSS],
+                                         margin=(0, 0, 0, 0))
+hex_pick = pn.widgets.Select(options={}, width=340, stylesheets=[INPUT_CSS], margin=(0, 0, 0, 0))
+hex_body = pn.Column(sizing_mode="stretch_width", margin=0)
+hex_detail = pn.Column(sizing_mode="stretch_width", margin=0)
+hex_table = html("", sizing_mode="stretch_width")
+
+
+def verdict_chip(v):
+    text = hexscreen.VERDICT_TEXT[v][0] if v in hexscreen.VERDICT_TEXT else "Waiting…"
+    return f'<span class="chip {v if v in hexscreen.VERDICT_TEXT else "none"}">{escape(text)}</span>'
+
+
+def _fmt(v, digits=2, unit=""):
+    return "–" if v is None or (isinstance(v, float) and not np.isfinite(v)) else f"{v:,.{digits}f}{unit}"
+
+
+def hex_fill(state, h):
+    """(fill colour, alpha) for a hex under the current colouring."""
+    by = HEX_COLOUR_BY[hex_colour.value]
+    if by is None:
+        c = VERDICT_COLOURS.get(h.get("verdict"))
+        return (c, 0.55) if c else ("#000000", 0.0)
+    v = h.get(by)
+    if v is None or not np.isfinite(v):
+        return ("#000000", 0.0)
+    hi = state["scale"].get(by) or 1.0
+    t = float(np.clip(v / hi, 0, 1))
+    return MAP_PALETTE[int(round(t * (len(MAP_PALETTE) - 1)))], 0.65
+
+
+def hex_columns(state):
+    """Column data for the hexagon patches."""
+    cols = {k: [] for k in ("xs", "ys", "id", "il", "xl", "fill", "alpha", "verdict", "fault", "throw",
+                            "seal_c", "seal", "chg", "gemma")}
+    for h in state["ctx"]["hexes"]:
+        fill, alpha = hex_fill(state, h)
+        g = h.get("gemma") or {}
+        cols["xs"].append(h["corners_xl"])
+        cols["ys"].append(h["corners_il"])
+        cols["id"].append(h["id"])
+        cols["il"].append(round(h["il_centre"]))
+        cols["xl"].append(round(h["xl_centre"]))
+        cols["fill"].append(fill)
+        cols["alpha"].append(alpha)
+        cols["verdict"].append(hexscreen.VERDICT_TEXT[h["verdict"]][0] if "verdict" in h else "waiting for Gemma…")
+        cols["fault"].append(h["fault_score"])
+        cols["throw"].append(h["throw_ms"])
+        cols["seal_c"].append(h["seal_contrast"])
+        cols["seal"].append(h["seal_score"])
+        cols["chg"].append(h["changed_pct"])
+        cols["gemma"].append(("not asked" if not g else f"error: {g['error'][:60]}" if g.get("error")
+                              else f"fault {g['fault']}, sealing {g['sealing']} ({g['confidence']:.0%})"))
+    return cols
+
+
+def label_columns(state):
+    hx = [h for h in state["ctx"]["hexes"] if h.get("verdict") in VERDICT_COLOURS]
+    return {"x": [h["xl_centre"] for h in hx], "y": [h["il_centre"] for h in hx],
+            "text": [str(h["id"]) for h in hx]}
+
+
+def hex_map(state):
+    ctx = state["ctx"]
+    grid, maps = ctx["grid"], ctx["maps"]
+    il, xl = grid["ilines"], grid["xlines"]
+    (x0, x1), (y0, y1) = extent(xl), extent(il)
+    p = make_figure(Range1d(x0, x1, bounds=(x0, x1)), Range1d(y0, y1, bounds=(y0, y1)),
+                    "Crossline", "Inline", height=520, value_label="4D change")
+    ws["figs"].remove(p)
+    ws["hfigs"].append(p)
+    p.toolbar.tools = [t for t in p.toolbar.tools if not isinstance(t, HoverTool)]
+
+    # background: 4D change (RMS of monitor - baseline) and the traces on a fault
+    chg = maps["diff_rms"]
+    floor = float(np.nanmedian(chg))
+    hi = float(np.nanpercentile(chg, 99.5)) if np.isfinite(chg).any() else 1.0
+    mapper = LinearColorMapper(palette=MAP_PALETTE, low=floor, high=max(hi, floor * 1.01 + 1e-9),
+                               nan_color="rgba(0,0,0,0)")
+    p.image(image=[chg], x=x0, y=y0, dw=x1 - x0, dh=y1 - y0, color_mapper=mapper)
+    on_fault = np.isfinite(maps["coherence"]) & (1 - maps["coherence"] > ctx["stats"]["fault_threshold"])
+    rgba = np.zeros(on_fault.shape, dtype=np.uint32)
+    view = rgba.view(np.uint8).reshape(on_fault.shape + (4,))
+    view[on_fault] = (255, 255, 255, 235)
+    p.image_rgba(image=[rgba], x=x0, y=y0, dw=x1 - x0, dh=y1 - y0)
+    add_colorbar(p, mapper, "4D change (RMS of monitor − baseline) · white = traces on a fault")
+
+    src = ColumnDataSource(hex_columns(state))
+    r = p.patches("xs", "ys", source=src, fill_color="fill", fill_alpha="alpha",
+                  line_color="#ffffff", line_alpha=0.55, line_width=1)
+    r.selection_glyph = Patches(fill_color="fill", fill_alpha="alpha", line_color=THEMES[ws["theme"]]["accent"],
+                                line_alpha=1, line_width=3.5)
+    r.nonselection_glyph = r.glyph.clone()
+    labels = ColumnDataSource(label_columns(state))
+    p.text("x", "y", "text", source=labels, text_align="center", text_baseline="middle",
+           text_color="#ffffff", text_font_size="11px", text_font_style="bold")
+    p.add_tools(HoverTool(renderers=[r], tooltips=[
+        ("Hex", "@id (inline @il / crossline @xl)"), ("Verdict", "@verdict"), ("Gemma", "@gemma"),
+        ("Fault score", "@fault{0.00}"), ("Throw", "@throw{0.0} ms"), ("Seal contrast", "@seal_c{0.00}"),
+        ("Seal score", "@seal{0.00}"), ("4D change", "@chg{0} % of traces"),
+    ]), TapTool(renderers=[r]))
+    src.selected.on_change("indices", lambda attr, old, new: on_hex_tap(new))
+    state.update(src=src, label_src=labels, fig=p)
+    style_figure(p)  # again, now the colour bar is attached
+    return p
+
+
+def update_scales(state):
+    hexes = state["ctx"]["hexes"]
+    state["scale"] = {}
+    for key in HEX_COLOUR_BY.values():
+        if key:
+            v = np.array([h.get(key, np.nan) for h in hexes], dtype=float)
+            v = v[np.isfinite(v)]
+            state["scale"][key] = float(np.percentile(v, 99)) if v.size and np.percentile(v, 99) > 0 else 1.0
+    state["scale"]["fault_score"] = state["scale"]["seal_score"] = 1.0
+
+
+def refresh_hex_colours(event=None):
+    state = ws.get("hex")
+    if not state or "src" not in state:
+        return
+    cols = hex_columns(state)
+    state["src"].data.update({k: cols[k] for k in ("fill", "alpha", "verdict", "gemma")})
+    state["label_src"].data = label_columns(state)
+
+
+def patch_hex(state, h):
+    """Update one hex on the map as soon as its result arrives."""
+    idx = state["index"][h["id"]]
+    fill, alpha = hex_fill(state, h)
+    g = h.get("gemma") or {}
+    gem = ("not asked" if not g else f"error: {g['error'][:60]}" if g.get("error")
+           else f"fault {g['fault']}, sealing {g['sealing']} ({g['confidence']:.0%})")
+    state["src"].patch({"fill": [(idx, fill)], "alpha": [(idx, alpha)],
+                        "verdict": [(idx, hexscreen.VERDICT_TEXT[h["verdict"]][0])], "gemma": [(idx, gem)]})
+    if h["verdict"] in VERDICT_COLOURS:
+        state["label_src"].stream({"x": [h["xl_centre"]], "y": [h["il_centre"]], "text": [str(h["id"])]})
+
+
+def ranked_hexes(state):
+    return sorted(state["ctx"]["hexes"],
+                  key=lambda h: (-hexscreen.VERDICT_RANK.get(h.get("verdict"), -1), -h["seal_score"],
+                                 -h["fault_score"], h["id"]))
+
+
+def hex_table_html(state):
+    rows = [h for h in ranked_hexes(state) if h.get("verdict") in VERDICT_COLOURS][:40]
+    if not rows:
+        return '<p class="status">No hexagon shows a fault.</p>'
+    sel = state.get("selected")
+    body = "".join(
+        f'<tr class="{"sel" if h["id"] == sel else ""}"><td>{h["id"]}</td>'
+        f'<td>{h["il_centre"]:,.0f} / {h["xl_centre"]:,.0f}</td><td class="txt">{verdict_chip(h["verdict"])}</td>'
+        f'<td>{_fmt(h["fault_score"])}</td><td>{_fmt(h["throw_ms"], 1)}</td><td>{_fmt(h["seal_contrast"])}</td>'
+        f'<td>{_fmt(h["changed_pct"], 0, "%")}</td>'
+        f'<td class="txt">{escape(gemma_short(h))}</td></tr>' for h in rows)
+    return ('<table class="hex-table"><tr><th>Hex</th><th>Inline / crossline</th><th>Verdict</th>'
+            '<th>Fault score</th><th>Throw (ms)</th><th>Seal contrast</th><th>4D change</th><th>Gemma</th></tr>'
+            + body + '</table>')
+
+
+def gemma_short(h):
+    g = h.get("gemma")
+    if not g:
+        return "not asked"
+    if g.get("error"):
+        return "unavailable"
+    return f"fault {g['fault']}, sealing {g['sealing']}, {g['confidence']:.0%}"
+
+
+def hex_images(state, h):
+    """Montage PNGs for one hex (re-rendered on demand, last few kept)."""
+    cache = state.setdefault("images", {})
+    if h["id"] not in cache:
+        base, mon = ws["surveys"]
+        cache[h["id"]] = hexscreen.render_montages(state["ctx"], base["vol"], mon["vol"], h)
+        while len(cache) > 6:
+            cache.pop(next(iter(cache)))
+    return cache[h["id"]]
+
+
+def png_img(png, alt):
+    return f'<img alt="{escape(alt)}" src="data:image/png;base64,{base64.b64encode(png).decode()}">'
+
+
+def hex_detail_html(state, h):
+    inl, xln, _, _ = hexscreen.hex_lines(state["ctx"], h)
+    grid = state["ctx"]["grid"]
+    il_txt = ", ".join(f"{grid['ilines'][i]:.0f}" for i in inl)
+    xl_txt = ", ".join(f"{grid['xlines'][j]:.0f}" for j in xln)
+    lines = f"Inlines {il_txt} · crosslines {xl_txt}"
+    g = h.get("gemma")
+    if not g:
+        gem = '<p class="status">Gemma was not asked; the verdict comes from the attributes.</p>'
+    elif g.get("error"):
+        gem = (f'<p class="status err">Gemma unavailable ({escape(g["error"][:160])}); '
+               'the verdict comes from the attributes.</p>')
+    else:
+        gem = (f'<div class="summary" style="margin-top:8px">'
+               f'<div class="sum-col"><div class="sum-lang">English · Gemma</div>'
+               f'<p><b>Fault:</b> {escape(g["fault"])} · <b>sealing:</b> {escape(g["sealing"])} · '
+               f'<b>confidence:</b> {g["confidence"]:.0%}</p>'
+               + (f'<p><b>Where:</b> {escape(g["location"])}</p>' if g.get("location") else "")
+               + f'<p>{escape(g.get("evidence_en", ""))}</p></div>'
+               f'<div class="sum-col"><div class="sum-lang">Bahasa Melayu · Gemma</div>'
+               f'<p><b>Sesar:</b> {escape(g["fault"])} · <b>pengedap:</b> {escape(g["sealing"])} · '
+               f'<b>keyakinan:</b> {g["confidence"]:.0%}</p>'
+               f'<p>{escape(g.get("evidence_ms", ""))}</p></div></div>')
+    attrs = [("Fault score", _fmt(h["fault_score"])), ("Throw", _fmt(h["throw_ms"], 1, " ms")),
+             ("Seal contrast", _fmt(h["seal_contrast"])), ("Seal score", _fmt(h["seal_score"])),
+             ("Traces on fault", f'{h["fault_traces"]}'), ("Fault trend", _fmt(h["fault_trend_deg"], 0, "°")),
+             ("Coherence", _fmt(h["coherence"])), ("4D change", _fmt(h["changed_pct"], 0, "% of traces")),
+             ("NRMS", _fmt(h["nrms"], 0, "%")), ("Amplitude ratio", _fmt(h["amp_ratio"])),
+             ("Time shift", _fmt(h["time_shift_ms"], 1, " ms")), ("Inst. frequency", _fmt(h["inst_freq_hz"], 0, " Hz")),
+             ("RMS baseline", _fmt(h["rms_base"], 3)), ("RMS monitor", _fmt(h["rms_mon"], 3)),
+             ("Envelope", _fmt(h["envelope"], 3)), ("Sweetness", _fmt(h["sweetness"], 3))]
+    grid_html = "".join(f"<div>{k}<b>{v}</b></div>" for k, v in attrs)
+    amp, diff = hex_images(state, h)
+    return (f'<div class="hex-detail"><h3>Hex {h["id"]} · inline {h["il_centre"]:,.0f} / crossline '
+            f'{h["xl_centre"]:,.0f} &nbsp;{verdict_chip(h["verdict"])} '
+            f'<span class="meta">{escape(h["verdict_source"])}</span></h3>'
+            f'<div class="lines">{lines} · {h["n_traces"]} traces</div>'
+            f'{gem}<div class="attr-grid">{grid_html}</div>'
+            f'<div class="hex-imgs">{png_img(amp, "monitor amplitude sections")}'
+            f'{png_img(diff, "4D difference sections")}</div></div>')
+
+
+def show_hex(hex_id):
+    state = ws.get("hex")
+    if not state or "ctx" not in state:
+        return
+    h = next((x for x in state["ctx"]["hexes"] if x["id"] == hex_id), None)
+    if h is None or "verdict" not in h:
+        return
+    state["selected"] = hex_id
+    hex_detail.objects = [html(hex_detail_html(state, h), sizing_mode="stretch_width")]
+    hex_table.object = hex_table_html(state)
+    idx = state["index"][hex_id]
+    if state["src"].selected.indices != [idx]:
+        state["syncing"] = True
+        state["src"].selected.indices = [idx]
+        state["syncing"] = False
+    if hex_pick.value != hex_id:
+        hex_pick.value = hex_id
+
+
+def on_hex_tap(indices):
+    state = ws.get("hex")
+    if not state or state.get("syncing") or not indices or not state.get("done"):
+        return
+    show_hex(state["ctx"]["hexes"][indices[0]]["id"])
+
+
+def on_hex_pick(event):
+    state = ws.get("hex")
+    if state and state.get("done") and event.new is not None and event.new != state.get("selected"):
+        show_hex(event.new)
+
+
+def hex_tiles(state):
+    counts = hexscreen.summary_counts(state["ctx"]["hexes"])
+    n = len(state["ctx"]["hexes"])
+    return html('<div class="tiles four">'
+                + "".join(stat_tile(hexscreen.VERDICT_TEXT[v][0], f"{counts[v]}", f"of {n} hexes")
+                          for v in hexscreen.VERDICTS) + '</div>', sizing_mode="stretch_width")
+
+
+HEX_LEGEND = ('<div class="legend">'
+              + "".join(f'<span><i style="background:{c}"></i>{hexscreen.VERDICT_TEXT[v][0]}</span>'
+                        for v, c in VERDICT_COLOURS.items())
+              + '<span><i style="background:transparent;border:1px solid var(--border-strong)"></i>'
+                'No fault found</span><span class="meta">· click a hexagon for its sections and Gemma\'s reading'
+                '</span></div>')
+
+
+def reset_hex(message=None):
+    ws["hex"] = None
+    ws["hfigs"] = []
+    hex_body.objects = []
+    hex_detail.objects = []
+    hex_table.object = ""
+    hex_pick.options = {}
+    hex_csv_btn.disabled = hex_pdf_btn.disabled = True
+    hex_status.object = message or HEX_INTRO
+
+
+def in_doc(doc, fn, *args):
+    """Run fn on the document's next tick (with its lock). Raw Bokeh objects such as
+    the hex map's data source may only be changed that way from an async callback."""
+    if doc is None:
+        fn(*args)
+    else:
+        doc.add_next_tick_callback(functools.partial(fn, *args))
+
+
+async def on_hex_run(event=None):
+    doc = pn.state.curdoc
+    surveys = ws["surveys"]
+    if len(surveys) != 2 or any(s_["vol"] is None for s_ in surveys):
+        reset_hex('<span class="status err">Load both surveys first.</span>')
+        return
+    base, mon = surveys
+    reset_hex('<span class="status">Measuring attributes on every trace…</span>')
+    state = {"labels": (base["title"], mon["title"]), "files": (base["name"], mon["name"]),
+             "credit": ws["credit"], "done": False, "selected": None}
+    ws["hex"] = state
+    set_label(hex_run_btn, "Screening…")
+    hex_run_btn.disabled = True
+    try:
+        ctx = await asyncio.to_thread(hexscreen.prepare, base["vol"], mon["vol"])
+        if ws["hex"] is not state:
+            return
+        if not ctx["hexes"]:
+            raise ValueError("no hexagon fits inside the area the two surveys share")
+        state["ctx"] = ctx
+        state["index"] = {h["id"]: k for k, h in enumerate(ctx["hexes"])}
+        update_scales(state)
+        hex_body.objects = [
+            pn.Row(html('<span class="meta">Colour hexagons by</span>', align="center", margin=(0, 10, 0, 0)),
+                   hex_colour, sizing_mode="stretch_width", margin=(12, 0, 0, 0)),
+            html(HEX_LEGEND, sizing_mode="stretch_width"),
+            plot_with_caption(hex_map(state), "Hexagons over the 4D change map"),
+        ]
+        total = len(ctx["hexes"])
+        use = USE_GEMMA
+        client, breaker = None, hexscreen.GemmaBreaker()
+        if use:
+            try:
+                client = gemma_client.make_client(gemma_client.settings(GEMMA_URL, GEMMA_MODEL))
+            except Exception as exc:
+                use, breaker.first_error = False, str(exc)
+        sem = asyncio.Semaphore(GEMMA_WORKERS)
+        hex_status.object = (f'<span class="status">{total} hexagons · '
+                             + ("asking Gemma… 0 / " + str(total) if use else "attributes only") + '</span>')
+
+        async def one(h):
+            async with sem:
+                await asyncio.to_thread(hexscreen.screen_hex, ctx, base["vol"], mon["vol"], h, use,
+                                        state["labels"], client, GEMMA_URL, GEMMA_MODEL, breaker)
+            return h
+
+        done = 0
+        for fut in asyncio.as_completed([one(h) for h in ctx["hexes"]]):
+            h = await fut
+            if ws["hex"] is not state:
+                return
+            done += 1
+            in_doc(doc, patch_hex, state, h)
+            if use:
+                hex_status.object = f'<span class="status">Asking Gemma… {done} / {total} hexagons</span>'
+
+        state["done"] = True
+        hex_pick.options = {f"Hex {h['id']} · {hexscreen.VERDICT_TEXT[h['verdict']][0]}": h["id"]
+                            for h in ranked_hexes(state)}
+        state["selected"] = ranked_hexes(state)[0]["id"]  # shown below; set the dropdown to match
+        hex_pick.value = state["selected"]
+        hex_body.objects = [hex_tiles(state)] + list(hex_body.objects) + [
+            html('<div class="plot-caption" style="margin-top:14px">Hexagons with a fault, strongest first</div>',
+                 sizing_mode="stretch_width"),
+            hex_table,
+            pn.Row(html('<span class="meta">Show hexagon</span>', align="center", margin=(0, 10, 0, 0)),
+                   hex_pick, sizing_mode="stretch_width", margin=(14, 0, 0, 0)),
+            hex_detail,
+        ]
+        in_doc(doc, show_hex, ranked_hexes(state)[0]["id"])
+        hex_csv_btn.filename = pdf_filename().replace("4D_analysis", "fault_screening").replace(".pdf", ".csv")
+        hex_pdf_btn.filename = pdf_filename().replace("4D_analysis", "fault_screening")
+        hex_csv_btn.disabled = hex_pdf_btn.disabled = False
+        counts = hexscreen.summary_counts(ctx["hexes"])
+        failed = sum(1 for h in ctx["hexes"] if (h.get("gemma") or {}).get("error"))
+        msg = (f'<span class="status ok">Done</span><span class="status"> · {total} hexagons · '
+               f'{counts["likely"]} likely and {counts["possible"]} possible sealing faults, '
+               f'{counts["fault"]} other faults</span>')
+        if use and failed:
+            err = breaker.first_error or next(h["gemma"]["error"] for h in ctx["hexes"]
+                                              if (h.get("gemma") or {}).get("error"))
+            msg += (f'<br><span class="status err">Gemma unavailable for {failed} of {total} hexagons '
+                    f'({escape(err[:140])}); those use the attributes only.</span>')
+        elif not use and USE_GEMMA:
+            msg += f'<br><span class="status err">Gemma unavailable ({escape(str(breaker.first_error)[:140])}).</span>'
+        hex_status.object = msg
+    except Exception as exc:
+        if ws["hex"] is state:
+            reset_hex(f'<span class="status err">Fault screening failed: {escape(str(exc))}</span>')
+    finally:
+        set_label(hex_run_btn, "Run fault screening")
+        hex_run_btn.disabled = False
+
+
+def make_hex_csv():
+    state = ws["hex"]
+    return io.BytesIO(hexscreen.to_csv(state["ctx"]["hexes"]).encode("utf-8"))
+
+
+def fault_pdf_pages(pdf, state, first_page, stamp):
+    """Fault screening pages for a PDF: hex map, flagged-hex table, evidence, top montages."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib.colors import LinearSegmentedColormap
+    from matplotlib.figure import Figure
+    from matplotlib.patches import Patch, Polygon
+    from PIL import Image
+
+    ctx, (base_label, mon_label) = state["ctx"], state["labels"]
+    credit = (state.get("credit") or "").strip()
+    a4 = (8.27, 11.69)
+    ink, grey = "#13212a", "#5b6b73"
+    page = first_page
+    hexes = ctx["hexes"]
+    ranked = ranked_hexes(state)
+    flagged = [h for h in ranked if h.get("verdict") in VERDICT_COLOURS]
+    counts = hexscreen.summary_counts(hexes)
+
+    def footer(fig):
+        if credit:
+            for k, line in enumerate(textwrap.wrap(credit, 120)):
+                fig.text(0.07, 0.035 - k * 0.012, line, fontsize=6.5, color=grey)
+        fig.text(0.93, 0.035, f"Reservoir Time Machine · page {page}", fontsize=6.5, color=grey, ha="right")
+
+    # map page
+    fig = Figure(figsize=a4)
+    fig.text(0.07, 0.95, "Sealing Fault Screening", fontsize=18, weight="bold", color=ink)
+    fig.text(0.07, 0.928, f"{base_label} (baseline) vs {mon_label} (monitor) · {stamp}", fontsize=9.5, color=grey)
+    st = ctx["stats"]
+    rows = [("Hexagons", f"{len(hexes)} · {st['hex_width']} lines across · 5 inlines + 5 crosslines each "
+                         f"(centre {', '.join(f'{d:+d}' for d in st['line_offsets'])})"),
+            ("Sealing fault likely", f"{counts['likely']}"), ("Sealing fault possible", f"{counts['possible']}"),
+            ("Fault, no sealing evidence", f"{counts['fault']}"), ("No fault found", f"{counts['none']}"),
+            ("Method", "trace attributes (coherence, throw, 4D change, seal contrast) + Gemma reading of the sections")]
+    y = 0.89
+    for label, value in rows:
+        fig.text(0.07, y, label, fontsize=9.5, color=grey)
+        for k, part in enumerate(textwrap.wrap(value, 78)):
+            fig.text(0.34, y, part, fontsize=9.5, color=ink)
+            y -= 0.021 if k == 0 else 0.017
+        y -= 0.0
+    ax = fig.add_axes([0.09, 0.14, 0.82, y - 0.17])
+    grid, maps = ctx["grid"], ctx["maps"]
+    (x0, x1), (y0, y1) = extent(grid["xlines"]), extent(grid["ilines"])
+    chg = maps["diff_rms"]
+    floor = float(np.nanmedian(chg))
+    hi = float(np.nanpercentile(chg, 99.5))
+    ax.imshow(chg, origin="lower", extent=(x0, x1, y0, y1), aspect="auto", interpolation="nearest",
+              cmap=LinearSegmentedColormap.from_list("map", MAP_PALETTE), vmin=floor, vmax=max(hi, floor + 1e-9))
+    on_fault = np.isfinite(maps["coherence"]) & (1 - maps["coherence"] > st["fault_threshold"])
+    overlay = np.zeros(on_fault.shape + (4,))
+    overlay[on_fault] = (1, 1, 1, 0.95)
+    ax.imshow(overlay, origin="lower", extent=(x0, x1, y0, y1), aspect="auto", interpolation="nearest")
+    for h in hexes:
+        c = VERDICT_COLOURS.get(h.get("verdict"))
+        ax.add_patch(Polygon(list(zip(h["corners_xl"], h["corners_il"])), closed=True,
+                             fc=c or "none", alpha=0.55 if c else 1, ec="white", lw=0.6))
+        if c:
+            ax.text(h["xl_centre"], h["il_centre"], str(h["id"]), ha="center", va="center", fontsize=7,
+                    color="white", weight="bold")
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y0, y1)
+    ax.set_xlabel("Crossline", fontsize=8.5)
+    ax.set_ylabel("Inline", fontsize=8.5)
+    ax.tick_params(labelsize=7.5)
+    ax.set_title("Hexagons over the 4D change map (white = traces on a fault)", fontsize=10, color=ink, loc="left")
+    ax.legend(handles=[Patch(fc=c, alpha=0.7, label=hexscreen.VERDICT_TEXT[v][0]) for v, c in VERDICT_COLOURS.items()],
+              loc="upper center", bbox_to_anchor=(0.5, -0.07), ncol=3, fontsize=8, frameon=False)
+    footer(fig)
+    pdf.savefig(fig)
+    page += 1
+
+    # table + evidence pages (English, then Malay)
+    for lang, title in (("en", "Hexagons with a fault"), ("ms", "Heksagon dengan sesar")):
+        fig = Figure(figsize=a4)
+        fig.text(0.07, 0.95, title, fontsize=16, weight="bold", color=ink)
+        fig.text(0.07, 0.93, f"{base_label} → {mon_label} · {stamp}", fontsize=9, color=grey)
+        y = 0.895
+        if lang == "en":
+            head = ["Hex", "Inline / xline", "Verdict", "Fault", "Throw ms", "Seal c.", "4D chg", "Gemma"]
+            xs = [0.07, 0.12, 0.25, 0.47, 0.54, 0.62, 0.69, 0.76]
+            for x, t in zip(xs, head):
+                fig.text(x, y, t, fontsize=8, color=grey)
+            y -= 0.018
+            for h in flagged[:18]:
+                vals = [str(h["id"]), f"{h['il_centre']:.0f} / {h['xl_centre']:.0f}",
+                        hexscreen.VERDICT_TEXT[h["verdict"]][0], _fmt(h["fault_score"]), _fmt(h["throw_ms"], 1),
+                        _fmt(h["seal_contrast"]), _fmt(h["changed_pct"], 0, "%"), gemma_short(h)]
+                for x, t in zip(xs, vals):
+                    fig.text(x, y, t, fontsize=7.8, color=ink)
+                y -= 0.017
+            if len(flagged) > 18:
+                fig.text(0.07, y, f"… and {len(flagged) - 18} more in the CSV export", fontsize=7.8, color=grey)
+                y -= 0.017
+            y -= 0.015
+        for h in flagged[:8]:
+            g = h.get("gemma") or {}
+            fig.text(0.07, y, f"Hex {h['id']} · {hexscreen.VERDICT_TEXT[h['verdict']][0 if lang == 'en' else 1]}"
+                              f" · inline {h['il_centre']:.0f} / crossline {h['xl_centre']:.0f}",
+                     fontsize=9.5, weight="bold", color=ink)
+            y -= 0.019
+            if g and not g.get("error"):
+                text = (g.get("evidence_en") if lang == "en" else g.get("evidence_ms")) or ""
+                if g.get("location"):
+                    text += (" Where: " if lang == "en" else " Lokasi: ") + g["location"].rstrip(". ") + "."
+            else:
+                text = ("Verdict from the attributes only (Gemma not available)." if lang == "en"
+                        else "Keputusan berdasarkan atribut sahaja (Gemma tidak tersedia).")
+            text += (f" Fault score {_fmt(h['fault_score'])}, throw {_fmt(h['throw_ms'], 1)} ms, "
+                     f"seal contrast {_fmt(h['seal_contrast'])}.")
+            for line in textwrap.wrap(text, 100):
+                fig.text(0.07, y, line, fontsize=8.8, color=ink)
+                y -= 0.016
+            y -= 0.012
+            if y < 0.1:
+                break
+        if not flagged:
+            fig.text(0.07, y, "No hexagon shows a fault." if lang == "en" else "Tiada heksagon menunjukkan sesar.",
+                     fontsize=10, color=ink)
+        footer(fig)
+        pdf.savefig(fig)
+        page += 1
+
+    # sections of the top hexagons
+    base, mon = ws["surveys"]
+    for h in flagged[:3]:
+        amp, diff = hex_images(state, h)
+        fig = Figure(figsize=a4)
+        fig.text(0.07, 0.95, f"Hex {h['id']} · {hexscreen.VERDICT_TEXT[h['verdict']][0]}", fontsize=15,
+                 weight="bold", color=ink)
+        fig.text(0.07, 0.93, f"inline {h['il_centre']:.0f} / crossline {h['xl_centre']:.0f} · "
+                             f"{h['verdict_source']}", fontsize=9, color=grey)
+        for k, png in enumerate((amp, diff)):
+            img = np.asarray(Image.open(io.BytesIO(png)).convert("RGB"))
+            hh = 0.4
+            a = fig.add_axes([0.05, 0.5 - k * 0.43, 0.9, hh])
+            a.imshow(img)
+            a.axis("off")
+        footer(fig)
+        pdf.savefig(fig)
+        page += 1
+    return page
+
+
+def make_hex_pdf():
+    from matplotlib.backends.backend_pdf import PdfPages
+    buf = io.BytesIO()
+    with PdfPages(buf) as pdf:
+        fault_pdf_pages(pdf, ws["hex"], 1, datetime.now().strftime("%d %b %Y, %H:%M"))
+    buf.seek(0)
+    return buf
+
+
+hex_csv_btn = pn.widgets.FileDownload(callback=make_hex_csv, filename="fault_screening.csv", label="Export CSV",
+                                      disabled=True, button_type="default", width=120, stylesheets=[BTN_BASE_CSS])
+hex_pdf_btn = pn.widgets.FileDownload(callback=make_hex_pdf, filename="fault_screening.pdf", label="Fault report",
+                                      disabled=True, button_type="default", width=130, stylesheets=[BTN_BASE_CSS])
+hex_run_btn.on_click(on_hex_run)
+hex_colour.param.watch(refresh_hex_colours, "value")
+hex_pick.param.watch(on_hex_pick, "value")
+
+hex_card = pn.Column(
+    html('<div class="head"><h2 class="title">Fault screening</h2>'
+         '<span class="meta">Hexagons · trace attributes · Gemma</span></div>', sizing_mode="stretch_width"),
+    pn.Row(hex_run_btn, hex_csv_btn, hex_pdf_btn, hex_status, sizing_mode="stretch_width", margin=(8, 0, 0, 0)),
+    hex_body,
+    sizing_mode="stretch_width",
+    styles=CARD_STYLES,
+    margin=(8, 0),
+)
+
+
 load_btn.on_click(rebuild)
 
 
 def on_theme_change(event):
     ws["theme"] = "light" if event.new else "dark"
-    for p in ws["figs"] + ws["afigs"]:
+    for p in ws["figs"] + ws["afigs"] + ws["hfigs"]:
         style_figure(p)
 
 
@@ -2375,6 +2917,7 @@ workspace = pn.Column(
     display_bar,
     content,
     analysis_card,
+    hex_card,
     sizing_mode="stretch_width",
     margin=0,
     visible=False,
